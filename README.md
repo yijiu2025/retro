@@ -238,14 +238,21 @@ RETRO_LLM_TIMEOUT=300
 
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
-| GET | `/api/health` | 健康检查 |
-| GET | `/api/models` | 可用模型列表 |
+| GET | `/api/models` | 可用模型列表 + 各自是否已加载 |
+| POST | `/api/load` | 预热：提前把模型加载进内存 |
 | POST | `/api/predict` | **单步**逆合成预测（前端靠反复调它长出整棵路线树） |
+| POST | `/api/search` | 一次搜到底的多步路线搜索（前端**不用**，仅供脚本/调试） |
 | POST | `/api/parse` | molfile / SMILES → 规范结构 + 分子式 / 分子量 |
 | POST | `/api/depict` | SMILES → 带 2D 坐标的 molfile（画板载入用） |
+| GET/POST | `/api/jobs` | 长任务提交与列表 |
+| GET | `/api/jobs/<id>` | 查任务状态 / 取结果 |
+| POST | `/api/jobs/<id>/cancel` | 取消任务 |
 | GET | `/api/llm/status` | 大模型配置状态（`?probe=1` 会真实请求一次） |
 | GET | `/api/llm/models` | 该 key 下可用的模型 |
-| POST | `/api/llm/analyze` | 工艺分析（SSE 流式返回） |
+| POST | `/api/llm/analyze` | 工艺分析（一次性返回） |
+| POST | `/api/llm/analyze/stream` | 工艺分析（**SSE 流式**） |
+
+> 没有 `/api/health`。想快速判断服务活着没，用 `/api/models`（它同时能看出模型加载到哪一步）。
 
 ---
 
