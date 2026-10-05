@@ -41,7 +41,7 @@ import traceback
 import queue
 import concurrent.futures
 
-from flask import Flask, Response, jsonify, request, send_from_directory
+from flask import Flask, Response, jsonify, request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -57,8 +57,6 @@ try:
     import _limit_workers  # noqa: F401
 except Exception as _e:  # noqa: BLE001
     print(f"[app] 注意：未能限制规则子进程数（{_e}）")
-
-STATIC = os.path.join(HERE, "static")
 
 # --- 模型目录：**默认按相对位置推导，可用环境变量覆盖** --------------------
 # 🔴 曾经写死 `F:\retrochimera\models\...` ⇒ 换台机器/换盘符就直接崩，
@@ -559,14 +557,38 @@ def make_value_function(kind, inventory, max_heavy_atoms):
 # --------------------------------------------------------------------------
 # 路由
 # --------------------------------------------------------------------------
+# 🔴 本服务**只提供 API，不托管任何前端页面**（前端在 retroweb 仓库）。
+#    访问根路径给一份自描述，方便浏览器直接打开时知道这是哪儿、有哪些接口。
+_API_INDEX = {
+    "service": "RetroChimera API",
+    "hint": "本服务只提供 API。前端界面在 retroweb 仓库，由它来调用这些接口。",
+    "endpoints": [
+        {"method": "GET", "path": "/api/models", "desc": "可用模型 + 是否已加载"},
+        {"method": "POST", "path": "/api/load", "desc": "预热：提前把模型加载进内存"},
+        {"method": "POST", "path": "/api/predict", "desc": "单步逆合成预测"},
+        {"method": "POST", "path": "/api/search", "desc": "多步路线搜索（脚本/调试用）"},
+        {"method": "POST", "path": "/api/parse", "desc": "结构文本 → 规范结构 + 分子式/分子量"},
+        {"method": "POST", "path": "/api/depict", "desc": "SMILES → 带 2D 坐标的 molfile"},
+        {"method": "GET", "path": "/api/jobs", "desc": "任务列表"},
+        {"method": "POST", "path": "/api/jobs", "desc": "提交长任务"},
+        {"method": "GET", "path": "/api/jobs/<job_id>", "desc": "查任务状态 / 取结果"},
+        {"method": "POST", "path": "/api/jobs/<job_id>/cancel", "desc": "取消任务"},
+        {"method": "GET", "path": "/api/llm/status", "desc": "大模型配置状态（?probe=1 真实验证）"},
+        {"method": "GET", "path": "/api/llm/models", "desc": "该 key 下可见的模型"},
+        {"method": "POST", "path": "/api/llm/analyze", "desc": "工艺分析（一次性返回）"},
+        {"method": "POST", "path": "/api/llm/analyze/stream", "desc": "工艺分析（SSE 流式）"},
+    ],
+}
+
+
 @app.route("/")
 def index():
-    return send_from_directory(STATIC, "index.html")
+    return jsonify(_API_INDEX)
 
 
-@app.route("/static/<path:filename>")
-def static_files(filename):
-    return send_from_directory(STATIC, filename)
+@app.route("/api")
+def api_index():
+    return jsonify(_API_INDEX)
 
 
 @app.route("/api/models")

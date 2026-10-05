@@ -63,7 +63,9 @@ flask
 requests
 
 # ============================================================
-# 【第 4 步】RetroChimera 本体（不在本仓库，需单独获取后本地安装）
-#   cd <retrochimera 仓库根>
+# 【第 4 步】RetroChimera 本体 —— 源码已在本仓库，直接装
+#   cd ../upstream
 #   pip install -e .
+#   （卡在 build 依赖上就加 --no-build-isolation）
+#   说明见 upstream/VENDORED.md
 # ============================================================

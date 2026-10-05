@@ -19,10 +19,9 @@ dist/
 # === 运行时日志 / 备份 ===
 web/_startup_log.txt
 *.log
-web/static/index.html.bak-*
 *.bak
 
-# === 上游源码副本（独立 git 仓，用 scripts/fetch-upstream.* 获取）===
+# === 旧的上游源码克隆目录（现已 vendored 到 upstream/，此目录不再需要）===
 repo/
 
 # === 编辑器 / 系统 ===
@@ -30,3 +29,6 @@ repo/
 .idea/
 .DS_Store
 Thumbs.db
+
+# === 临时工作目录（vendored 上游准备、探针等，绝不入库）===
+.tmp-*/

@@ -96,16 +96,20 @@ if not errorlevel 1 (
     exit /b 1
 )
 
-echo [2/3] Starting server ...
+echo [2/3] Starting API server ...
 echo.
-echo   Opening browser: http://127.0.0.1:%RETRO_PORT%
+echo   API listening on: http://127.0.0.1:%RETRO_PORT%
+echo.
+echo   NOTE: this is the API only -- it serves no web page.
+echo         The UI lives in the retroweb repo (npm run dev, port 5177).
+echo         Opening the root URL shows the endpoint list as JSON.
+echo.
 echo   Close this window to stop the server.
 echo.
-echo   NOTE: closing the server may print red "BrokenPipeError" lines.
-echo         That is NORMAL (worker cleanup) and does not affect results.
+echo   Closing the server may print red "BrokenPipeError" lines.
+echo   That is NORMAL (worker cleanup) and does not affect results.
 echo.
 echo [start] launching app.py >> "%LOGFILE%"
-start "" http://127.0.0.1:%RETRO_PORT%
 "%ENV_PY%" -u "%~dp0app.py" 2>>"%LOGFILE%"
 
 echo.
@@ -114,7 +118,7 @@ echo       Details: _startup_log.txt
 echo.
 echo   Tips:
 echo     - Red BrokenPipeError lines on exit are normal, not a crash.
-echo     - If the page cannot open, check _startup_log.txt.
+echo     - If the API does not respond, check _startup_log.txt.
 pause
 exit /b 0
 

@@ -1,9 +1,11 @@
-# RetroChimera Web 后端
+# RetroChimera API 后端
 
-给 [microsoft/retrochimera](https://github.com/microsoft/retrochimera) 加的一层 **Flask Web API**，
-对外提供单步逆合成预测、结构式解析/绘制、以及基于大模型的工艺分析。
+[RetroChimera](https://github.com/microsoft/retrochimera)（微软的逆合成预测模型）之上的
+一层 **Flask API**：单步逆合成预测、结构式解析/绘制、基于大模型的工艺分析。
 
-前端在另一个仓库：[retroweb](https://github.com/yijiu2025/retroweb)。
+> 🔴 **本服务只提供 API，不托管任何前端页面。**
+> 浏览器直接打开根路径会返回一份 JSON 端点清单。
+> 前端界面在另一个仓库：[retroweb](https://github.com/yijiu2025/retroweb)。
 
 ---
 
@@ -11,22 +13,25 @@
 
 ```
 retrochimera/
-├── web/                     ← 本项目主体（我们自己写的）
-│   ├── app.py                Flask 应用 + 全部 API 路由
-│   ├── llm.py                大模型调用 + SSE 流式分析
-│   ├── jobhub.py             任务队列（长任务不阻塞请求）
-│   ├── .env.example          配置模板（复制成 .env 再填）
-│   ├── requirements.txt      依赖清单（除上游本体）
-│   └── 启动网页版.bat         Windows 一键启动
-├── scripts/fetch_upstream.py 拉取上游源码（repo/ 不入库）
-├── models/                  ← 模型权重，9GB，**不入库**
-│   ├── retrochimera_pistachio/
-│   └── retrochimera_uspto50k/
-└── repo/                    ← 上游源码（独立 git 仓，**不入库**）
+├── web/                   ← 本项目主体（我们自己的 API 层）
+│   ├── app.py              Flask 应用 + 全部 API 路由
+│   ├── llm.py              大模型调用 + SSE 流式分析
+│   ├── jobhub.py           任务队列（长任务不阻塞请求）
+│   ├── .env.example        配置模板（复制成 .env 再填）
+│   ├── requirements.txt    依赖清单（除上游本体）
+│   └── 启动后端API.bat      Windows 一键启动
+├── upstream/              ← 上游源码（**已 vendored 进本仓**，见其 VENDORED.md）
+│   ├── retrochimera/        上游 Python 包本体
+│   └── pyproject.toml       装它：cd upstream && pip install -e .
+└── models/                ← 模型权重，9GB，**不入库**
+    ├── retrochimera_pistachio/
+    └── retrochimera_uspto50k/
 ```
 
-`models/` 和 `repo/` 都被 `.gitignore` 排除 —— 前者体积太大，后者是别人的仓库。
-换机器时这两块都要重新准备（见第 3 节）。
+**上游源码不需要再单独 clone** —— 它已纳入本仓版本管理（`upstream/`，约 1.6MB）。
+装完依赖后 `cd upstream && pip install -e .` 即可。
+
+只有 `models/` 是仓库外的东西（9GB 太大），换机器时手动拷过去（见第 3.3 节）。
 
 ---
 
@@ -71,19 +76,27 @@ pip install -r web\requirements.txt
 它的 wheel 要从 `https://data.pyg.org/whl/torch-2.2.0+cu121.html` 拿，源目录名里是
 `torch-2.2.0` 而不是 `2.2.2`（这是上游的笔误，照抄即可）。
 
-### 3.2 拉上游源码
+### 3.2 装上游本体（源码已在本仓，无需 clone）
 
 ```bat
-python scripts\fetch_upstream.py
+cd F:\retrochimera\upstream
+pip install -e .
 ```
 
-它会 clone `microsoft/retrochimera` v1.3.0 到 `repo/` 并执行 `pip install -e .`。
 如果卡在 build 依赖上，改用：
 
 ```bat
-python scripts\fetch_upstream.py --no-install
-cd repo && pip install -e . --no-build-isolation
+pip install -e . --no-build-isolation
 ```
+
+验证：
+
+```bat
+python -c "import retrochimera; print(retrochimera.__file__)"
+```
+
+路径应落在 `F:\retrochimera\upstream\retrochimera\__init__.py`。
+上游源码的版本信息与更新方式见 `upstream/VENDORED.md`。
 
 ### 3.3 放模型权重
 
@@ -126,11 +139,11 @@ RETRO_LLM_MODEL=glm-5.2
 ### 方式一：双击（推荐）
 
 ```
-web\启动网页版.bat
+web\启动后端API.bat
 ```
 
 它会自动找 Python（顺序：`RETRO_PYTHON` 环境变量 → 当前 conda 环境 → `.venv` →
-默认 conda 路径 → PATH），然后拉起服务并打开浏览器。
+默认 conda 路径 → PATH），检测端口是否被占用，然后拉起 API 服务。
 
 想用它找别的解释器，先设一下：
 
@@ -152,6 +165,16 @@ python web\app.py
 python web\_run_web.py
 set RETRO_PORT=8011 && python web\_run_web.py
 ```
+
+启动后监听 **http://127.0.0.1:8000**。浏览器打开它只会看到 JSON 端点清单
+（本服务不托管页面），要界面得把前端跑起来：
+
+```bat
+cd <retroweb 仓库>
+npm install && npm run dev        # http://localhost:5177
+```
+
+> 关窗口时刷出一堆红色 `BrokenPipeError` 是**正常的**（worker 清理），不影响结果。
 
 启动后监听 **http://127.0.0.1:8000**。
 
@@ -192,6 +215,9 @@ set RETRO_CORS_ORIGINS=https://your-frontend.example.com
 ```
 
 不配的症状是浏览器控制台报跨域、页面数据永远转圈。
+
+> 本服务**不托管前端**：`/` 只返回端点清单 JSON，`/api/*` 才是接口。
+> 想快速验证服务活着没，打 `/api/models`。
 
 ---
 
@@ -238,6 +264,7 @@ RETRO_LLM_TIMEOUT=300
 
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
+| GET | `/` | 端点清单（JSON，自描述 —— 本服务不托管页面） |
 | GET | `/api/models` | 可用模型列表 + 各自是否已加载 |
 | POST | `/api/load` | 预热：提前把模型加载进内存 |
 | POST | `/api/predict` | **单步**逆合成预测（前端靠反复调它长出整棵路线树） |
@@ -253,6 +280,7 @@ RETRO_LLM_TIMEOUT=300
 | POST | `/api/llm/analyze/stream` | 工艺分析（**SSE 流式**） |
 
 > 没有 `/api/health`。想快速判断服务活着没，用 `/api/models`（它同时能看出模型加载到哪一步）。
+> 也没有任何 HTML 路由 —— 这是刻意的，前后端分离，后端只管数据。
 
 ---
 
@@ -262,12 +290,13 @@ RETRO_LLM_TIMEOUT=300
   所以模型放在一个**非守护单线程** `multiprocessing.Process` worker 里，
   通过 `_REQ_Q` / `_RESP_Q` 两个队列通信。改这块之前先想清楚。
 - **首次请求很慢**。模型冷启动要加载数 GB 权重，前端有"预热"按钮可以先把它叫醒。
-- **`REQ_RULE_WORKERS` 调高会崩**，见第 5 节。
-- **`repo/` 里的上游代码是本项目依赖的一部分**，删了服务起不来，重新跑 `scripts/fetch_upstream.py` 即可。
+- **`RETRO_RULE_WORKERS` 调高会崩**，见第 5 节。
+- **`upstream/` 里的上游代码是本项目依赖的一部分**，删了服务起不来；
+  它是 vendored 的，重新从 git 拉本仓即可恢复（不需要联网去上游 clone）。
 
 ---
 
 ## 10. 许可
 
-`web/` 下的代码是本项目自己的；`repo/` 下的 RetroChimera 源码版权归 Microsoft，
-按其仓库内的 LICENSE 使用（MIT）。
+`web/` 下的代码是本项目自己的；`upstream/` 下的 RetroChimera 源码版权归 Microsoft，
+按其仓库内的 `LICENSE` 使用（MIT，见 `upstream/LICENSE`）。
