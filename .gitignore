@@ -1,0 +1,32 @@
+# === 模型权重（9GB，绝不入库）===
+models/
+*.zip
+
+# === 真实密钥（只提交 .env.example）===
+web/.env
+.env
+
+# === Python 产物 ===
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+build/
+dist/
+
+# === 运行时日志 / 备份 ===
+web/_startup_log.txt
+*.log
+web/static/index.html.bak-*
+*.bak
+
+# === 上游源码副本（独立 git 仓，用 scripts/fetch-upstream.* 获取）===
+repo/
+
+# === 编辑器 / 系统 ===
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

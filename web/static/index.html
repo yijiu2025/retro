@@ -1,0 +1,1936 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RetroChimera 逆合成预测 · 结构式与合成路径</title>
+<script src="/static/smiles-drawer.min.js"></script>
+<style>
+  :root {
+    --c-bg:      #f4f7fb;
+    --c-surface: #ffffff;
+    --c-line:    #e4e9f0;
+    --c-line-2:  #eef2f7;
+    --c-txt:     #0f172a;
+    --c-txt-2:   #475569;
+    --c-txt-3:   #7c8ba1;
+    --c-brand:   #2563eb;
+    --c-brand-d: #1d4ed8;
+    --c-brand-l: #eff6ff;
+    --c-ok:      #059669;
+    --c-ok-l:    #ecfdf5;
+    --c-warn:    #b45309;
+    --c-warn-l:  #fffbeb;
+    --c-bad:     #dc2626;
+    --c-bad-l:   #fef2f2;
+    --sh-1: 0 1px 2px rgba(15,23,42,.04), 0 1px 3px rgba(15,23,42,.06);
+    --sh-2: 0 1px 2px rgba(15,23,42,.04), 0 10px 26px -14px rgba(15,23,42,.22);
+    --sh-3: 0 2px 4px rgba(15,23,42,.05), 0 18px 40px -20px rgba(15,23,42,.28);
+    --r-sm: 8px; --r-md: 12px; --r-lg: 16px;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 0;
+    font-family: "Segoe UI", "Microsoft YaHei", -apple-system, BlinkMacSystemFont, sans-serif;
+    background:
+      radial-gradient(1200px 480px at 50% -180px, #e8effc 0%, rgba(232,239,252,0) 70%),
+      var(--c-bg);
+    color: var(--c-txt);
+    -webkit-font-smoothing: antialiased;
+  }
+  header {
+    background: linear-gradient(135deg, #16265c 0%, #1e40af 48%, #2f6df0 100%);
+    color: #fff; padding: 26px 32px 24px;
+    box-shadow: 0 1px 0 rgba(255,255,255,.08) inset, 0 4px 20px -6px rgba(30,64,175,.45);
+    position: relative; overflow: hidden;
+  }
+  header::after {
+    content: ''; position: absolute; inset: 0;
+    background: radial-gradient(560px 180px at 88% 0%, rgba(255,255,255,.16), transparent 70%);
+    pointer-events: none;
+  }
+  header h1 {
+    margin: 0; font-size: 22px; font-weight: 650; letter-spacing: .2px;
+    display: flex; align-items: center; gap: 10px;
+  }
+  header h1 .h-badge {
+    font-size: 10.5px; font-weight: 700; letter-spacing: .6px;
+    background: rgba(255,255,255,.18); border: 1px solid rgba(255,255,255,.25);
+    padding: 3px 8px; border-radius: 999px; text-transform: uppercase;
+  }
+  header p { margin: 7px 0 0; font-size: 13px; opacity: .88; line-height: 1.6; }
+  .wrap { max-width: 1280px; margin: 0 auto; padding: 26px 20px 72px; }
+  .card {
+    background: var(--c-surface); border-radius: var(--r-md); padding: 22px 24px;
+    box-shadow: var(--sh-2); border: 1px solid rgba(226,232,240,.9);
+    margin-bottom: 20px;
+  }
+  label { display: block; font-size: 13px; font-weight: 600; color: var(--c-txt-2); margin-bottom: 7px; }
+  input[type=text], select, input[type=number] {
+    width: 100%; padding: 10px 12px; font-size: 14px;
+    border: 1px solid #d5dce6; border-radius: var(--r-sm); background: #fff;
+    font-family: Consolas, "Courier New", monospace; color: var(--c-txt);
+    transition: border-color .15s, box-shadow .15s;
+  }
+  input[type=text]:focus, select:focus, input[type=number]:focus {
+    outline: none; border-color: var(--c-brand);
+    box-shadow: 0 0 0 3px rgba(37,99,235,.13);
+  }
+  .row { display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-end; }
+  .row > div { flex: 1; min-width: 150px; }
+  /* 指定起始物料行 */
+  .matrow {
+    display: flex; align-items: flex-end; gap: 14px; flex-wrap: wrap;
+    margin-top: 16px; padding-top: 15px; border-top: 1px dashed #e3e9f2;
+  }
+  .matrow > .matfield { flex: 1 1 340px; min-width: 240px; }
+  .matrow input[type=text] { font-size: 12.5px; padding: 9px 11px; }
+  .matrow .chk {
+    display: flex; align-items: center; gap: 7px; font-size: 12.5px;
+    color: var(--c-txt-2); font-weight: 500; cursor: pointer; white-space: nowrap;
+    padding: 9px 12px; border: 1px solid #e3e9f2; border-radius: var(--r-sm);
+    background: #fafbfd; user-select: none; transition: border-color .15s, background .15s;
+  }
+  .matrow .chk:hover { border-color: #bfd8fe; background: #fff; }
+  .matrow .chk input[type=checkbox] {
+    width: 15px; height: 15px; margin: 0; accent-color: var(--c-brand); cursor: pointer;
+  }
+  .matrow .hint { flex: 1 1 100%; font-size: 12px; color: #94a3b8; line-height: 1.55; margin-top: -3px; }
+  .btn {
+    background: linear-gradient(180deg, #3b76f0 0%, var(--c-brand) 100%);
+    color: #fff; border: none; padding: 11px 24px;
+    font-size: 14px; font-weight: 600; border-radius: var(--r-sm); cursor: pointer;
+    transition: filter .15s, transform .1s, box-shadow .15s;
+    white-space: nowrap; box-shadow: 0 1px 2px rgba(29,78,216,.25);
+  }
+  .btn:hover:not(:disabled) { filter: brightness(1.07); box-shadow: 0 4px 14px -4px rgba(29,78,216,.5); }
+  .btn:active:not(:disabled) { transform: translateY(1px); }
+  .btn:disabled { background: #c3cbd8; box-shadow: none; cursor: not-allowed; filter: none; }
+  .btn.sec { background: linear-gradient(180deg, #10b981 0%, var(--c-ok) 100%); box-shadow: 0 1px 2px rgba(5,150,105,.25); }
+  .btn.sec:hover:not(:disabled) { box-shadow: 0 4px 14px -4px rgba(5,150,105,.5); }
+  .btn.ghost {
+    background: #fff; color: var(--c-txt-2); border: 1px solid #d5dce6; box-shadow: var(--sh-1);
+  }
+  .btn.ghost:hover:not(:disabled) { background: #f8fafc; border-color: #c3cbd8; box-shadow: var(--sh-2); }
+  .examples { margin-top: 14px; font-size: 12.5px; color: var(--c-txt-3); }
+
+  /* ===== 输入模式切换 ===== */
+  .modes {
+    display: flex; gap: 10px; align-items: center; margin-bottom: 18px; flex-wrap: wrap;
+    background: #f8fafc; border: 1px solid var(--c-line-2); border-radius: var(--r-sm); padding: 9px 12px;
+  }
+  .modes .modes-title { font-size: 13px; font-weight: 600; color: var(--c-txt-2); margin-right: 2px; }
+  .modes label {
+    display: inline-flex; align-items: center; gap: 6px; margin: 0;
+    font-size: 13px; font-weight: 500; color: var(--c-txt-2); cursor: pointer;
+    padding: 6px 12px; border-radius: 999px; border: 1px solid transparent;
+    transition: background .15s, border-color .15s, color .15s;
+  }
+  .modes label:hover { background: #fff; border-color: var(--c-line); }
+  .modes input[type=radio] { accent-color: var(--c-brand); width: 15px; height: 15px; cursor: pointer; }
+  .modes label:has(input:checked) {
+    background: #fff; border-color: #bfd8fe; color: var(--c-brand-d);
+    box-shadow: 0 1px 2px rgba(37,99,235,.12); font-weight: 600;
+  }
+
+  /* 大输入域（结构式模式） */
+  .biginput {
+    width: 100%; min-height: 150px; box-sizing: border-box;
+    padding: 14px 16px; font-size: 15px; line-height: 1.75;
+    color: var(--c-txt); background: #fff;
+    border: 2px dashed #cbd5e1; border-radius: var(--r-md);
+    font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+    resize: vertical; transition: border-color .15s, background .15s, box-shadow .15s;
+  }
+  .biginput:focus { outline: none; border-color: var(--c-brand); background: #fbfdff; box-shadow: 0 0 0 3px rgba(37,99,235,.1); }
+  .biginput::placeholder { color: #a9b4c4; }
+  .biginput.drag { border-color: var(--c-ok); background: var(--c-ok-l); }
+  .biginput.mono { font-family: Consolas, "Courier New", monospace; font-size: 13px; }
+  .hint { font-size: 12px; color: var(--c-txt-3); margin-top: 8px; line-height: 1.75; }
+  .hint b { color: var(--c-txt-2); }
+  .parsed {
+    margin-top: 16px; padding: 14px 16px; border-radius: var(--r-md);
+    background: linear-gradient(180deg, #fbfdff 0%, #f7fafd 100%);
+    border: 1px solid #dbe7f6;
+  }
+  .parsed-head {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    font-size: 12.5px; font-weight: 600; color: var(--c-txt-2); margin-bottom: 11px;
+  }
+  .parsed-smi {
+    font-family: Consolas, "Courier New", monospace; font-size: 12.5px;
+    background: #fff; border: 1px solid var(--c-line); border-radius: var(--r-sm);
+    padding: 9px 11px; word-break: break-all; color: #1e40af;
+  }
+  /* 结构式预览：SVG 的宽高由 JS 按「恒定键长」算好后写入属性，
+     这里不能再加 max-width/height:auto，否则又会被压扁。 */
+  .parsed canvas, .parsed svg { max-width: none; height: auto; }
+  #parsedDraw { overflow: auto; text-align: center; }
+  #parsedDraw svg { display: inline-block; vertical-align: middle; }
+  .chip {
+    display: inline-block; background: var(--c-brand-l); color: #1e40af;
+    border: 1px solid #cfe0fd; border-radius: 999px;
+    padding: 4px 12px; margin: 4px 5px 4px 0; cursor: pointer; font-size: 12px;
+    transition: background .15s, transform .1s, box-shadow .15s;
+  }
+  .chip:hover { background: #dbeafe; transform: translateY(-1px); box-shadow: var(--sh-1); }
+  #status { font-size: 13.5px; margin-top: 14px; min-height: 20px; }
+  .spinner {
+    display: inline-block; width: 13px; height: 13px;
+    border: 2px solid #bfdbfe; border-top-color: var(--c-brand);
+    border-radius: 50%; animation: spin .8s linear infinite;
+    vertical-align: -2px; margin-right: 7px;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .err { color: #991b1b; background: var(--c-bad-l); border: 1px solid #fecaca;
+         padding: 12px 14px; border-radius: var(--r-sm); white-space: pre-wrap; line-height: 1.7; }
+  .meta { font-size: 12.5px; color: var(--c-txt-3); margin-bottom: 16px; line-height: 1.75; }
+  .warn {
+    background: var(--c-warn-l); border: 1px solid #fde68a; color: #92400e;
+    padding: 12px 14px; border-radius: var(--r-sm); font-size: 12.5px; margin-bottom: 16px;
+    line-height: 1.7;
+  }
+  .smi {
+    font-family: Consolas, "Courier New", monospace; font-size: 12px;
+    background: #f8fafc; border: 1px solid var(--c-line-2); border-radius: var(--r-sm);
+    padding: 8px 11px; word-break: break-all; color: var(--c-txt-2);
+  }
+  /* 结构图容器：横向可滚动兜底，分子本身由 JS 给定像素尺寸，不再被压缩 */
+  .draw {
+    background: linear-gradient(180deg, #fcfdff 0%, #f8fbfe 100%);
+    border: 1px solid var(--c-line-2); border-radius: var(--r-md);
+    padding: 14px 12px; text-align: center; overflow-x: auto; overflow-y: hidden;
+  }
+  .draw svg { max-width: none; height: auto; }
+  .foot { font-size: 12px; color: #9ca3af; margin-top: 8px; }
+
+  /* 标签页 */
+  .tabs { display: flex; gap: 4px; border-bottom: 2px solid var(--c-line); margin-bottom: 20px; }
+  .tab {
+    padding: 11px 20px; font-size: 14px; font-weight: 600; color: var(--c-txt-3);
+    cursor: pointer; border: none; background: none; border-bottom: 2px solid transparent;
+    margin-bottom: -2px; transition: color .15s, border-color .15s;
+    border-radius: var(--r-sm) var(--r-sm) 0 0;
+  }
+  .tab:hover { color: var(--c-brand); background: rgba(37,99,235,.05); }
+  .tab.active { color: var(--c-brand); border-bottom-color: var(--c-brand); }
+  .panel { display: none; }
+  .panel.active { display: block; }
+
+  /* 单步结果 */
+  .result {
+    border: 1px solid var(--c-line); border-radius: var(--r-md); padding: 16px 18px;
+    margin-bottom: 14px; background: #fff; transition: box-shadow .18s, transform .18s;
+  }
+  .result:hover { box-shadow: var(--sh-2); }
+  .result.high { border-left: 5px solid var(--c-bad); }
+  .result.mid  { border-left: 5px solid #f59e0b; }
+  .result.low  { border-left: 5px solid #9ca3af; }
+  .rhead { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; }
+  .rank { font-weight: 700; font-size: 15px; color: var(--c-txt); }
+  .badge { font-size: 11.5px; padding: 3px 9px; border-radius: 999px; font-weight: 600; }
+  .badge.high { background: #fee2e2; color: #b91c1c; }
+  .badge.mid  { background: #fef3c7; color: var(--c-warn); }
+  .badge.low  { background: #f3f4f6; color: var(--c-txt-3); }
+  .prob { font-size: 20px; font-weight: 700; color: var(--c-brand); font-variant-numeric: tabular-nums; }
+  .bar { height: 7px; background: #f1f5f9; border-radius: 4px; margin: 11px 0 13px; overflow: hidden; }
+  .bar > i { display: block; height: 100%; border-radius: 4px; background: linear-gradient(90deg,#60a5fa,#1d4ed8); }
+  .toggle { font-size: 12.5px; color: var(--c-txt-3); margin-top: 10px; }
+  .toggle label { display: inline; font-weight: 400; margin-left: 4px; cursor: pointer; }
+
+  /* ===== 合成路径（多步）===== */
+  .route {
+    border: 1px solid var(--c-line); border-radius: var(--r-lg); margin-bottom: 20px;
+    background: var(--c-surface); overflow: hidden; box-shadow: var(--sh-2);
+    transition: box-shadow .2s;
+  }
+  .route:hover { box-shadow: var(--sh-3); }
+  .route-head {
+    display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;
+    padding: 14px 20px; background: linear-gradient(180deg, #fbfcfe 0%, #f6f9fd 100%);
+    border-bottom: 1px solid var(--c-line-2);
+  }
+  .route-title {
+    font-size: 14.5px; font-weight: 700; color: var(--c-txt);
+    display: flex; align-items: center; gap: 9px;
+  }
+  .route-title .rt-idx {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 24px; height: 24px; border-radius: 7px; flex: 0 0 24px;
+    background: linear-gradient(180deg,#3b76f0,var(--c-brand)); color: #fff;
+    font-size: 12px; font-weight: 700; box-shadow: 0 2px 6px -2px rgba(37,99,235,.6);
+  }
+  .route-badges { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .pill {
+    font-size: 11.5px; font-weight: 600; padding: 4px 10px; border-radius: 999px;
+    background: var(--c-brand-l); color: #1e40af; border: 1px solid #dbe8fd;
+  }
+  .pill.gray { background: #f4f6f9; color: var(--c-txt-2); border-color: var(--c-line); }
+  .pill.gold { background: var(--c-warn-l); color: var(--c-warn); border-color: #fde68a; }
+
+  /* 视图切换（路线图 / 分步） */
+  .subview { display: flex; gap: 4px; padding: 14px 20px 0; }
+  .subview .sv {
+    font-size: 12.5px; font-weight: 600; color: var(--c-txt-3); cursor: pointer;
+    background: #f4f6f9; border: 1px solid var(--c-line); border-radius: 999px;
+    padding: 5px 13px; transition: all .15s;
+  }
+  .subview .sv:hover { color: var(--c-brand); border-color: #bfd8fe; background: #fff; }
+  .subview .sv.active {
+    color: #fff; background: linear-gradient(180deg,#3b76f0,var(--c-brand));
+    border-color: var(--c-brand); box-shadow: 0 2px 8px -3px rgba(37,99,235,.7);
+  }
+
+  .steps { padding: 16px 18px; }
+
+  /* 单步：反应物 + 箭头 + 产物 */
+  .step {
+    border: 1px solid var(--c-line-2); border-radius: var(--r-md); padding: 13px 15px;
+    margin-bottom: 12px; background: linear-gradient(180deg,#fdfefe 0%,#fafcff 100%);
+    position: relative; transition: box-shadow .18s;
+  }
+  .step:hover { box-shadow: var(--sh-1); }
+  .step-top {
+    display: flex; align-items: center; gap: 10px; margin-bottom: 8px; flex-wrap: wrap;
+  }
+  .step-no {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 22px; height: 22px; border-radius: 50%;
+    background: linear-gradient(180deg,#3b76f0,var(--c-brand)); color: #fff;
+    font-size: 12px; font-weight: 700; flex: 0 0 22px;
+    box-shadow: 0 2px 6px -2px rgba(37,99,235,.6);
+  }
+  .step-label { font-size: 13px; font-weight: 600; color: var(--c-txt-2); }
+  .step-prob {
+    margin-left: auto; font-size: 13px; font-weight: 700; color: var(--c-brand);
+    font-variant-numeric: tabular-nums; background: var(--c-brand-l);
+    padding: 2px 10px; border-radius: 999px;
+  }
+
+  /* 反应式一行：分子并排，放不下就换行（不再互相挤压）
+     用 stretch 让同行的 molcell 等高 —— 这样所有标签在一条水平线上；
+     分子本身则在「扣掉标签后」的剩余空间里垂直居中，与 +/→ 对齐。 */
+  .rxnline {
+    display: flex; align-items: stretch; justify-content: center;
+    flex-wrap: wrap; gap: 6px 2px; padding: 10px 0 4px;
+  }
+  .molcell {
+    flex: 0 0 auto; display: flex; flex-direction: column; align-items: center;
+    text-align: center; padding: 0 8px;
+  }
+  .molcell > div:last-child {
+    flex: 1 1 auto; width: 100%;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .molcell > div > svg { display: block; margin: 0 auto; }
+  .moltag {
+    font-size: 10.5px; font-weight: 700; margin-bottom: 5px;
+    color: var(--c-txt-3); letter-spacing: .4px; white-space: nowrap;
+    display: inline-block; padding: 2px 8px; border-radius: 999px; background: #f4f6f9;
+  }
+  .moltag.start  { color: #065f46; background: var(--c-ok-l); }
+  .moltag.target { color: #1e40af; background: var(--c-brand-l); }
+  /* +/→ 复用「分子格」的完全相同结构（隐形标签占位 + 居中区），
+     这样它能自动精确对齐分子中心，不需要任何魔法数字。 */
+  .molcell.op { padding: 0 6px; }
+  .molcell.op .moltag { visibility: hidden; }
+  .molcell.op .op-box {
+    font-size: 22px; color: #b6c2d1; user-select: none; line-height: 1;
+    white-space: nowrap;
+  }
+  .molcell.op.arrow .op-box { color: var(--c-brand); font-size: 27px; font-weight: 700; }
+
+  /* ===== 路线图（把整条路线画成一张连通的图）===== */
+  .rtmap {
+    position: relative; padding: 26px 18px 30px; overflow-x: auto;
+    background:
+      linear-gradient(180deg, #fdfefe 0%, #f8fbfe 100%);
+  }
+  .rtmap-inner { position: relative; width: max-content; margin: 0 auto; }
+  /* 连线层：绝对定位铺满，纯装饰，不接收鼠标事件 */
+  .rtmap-lines {
+    position: absolute; left: 0; top: 0; pointer-events: none; overflow: visible; z-index: 0;
+  }
+  .rtlayer {
+    display: flex; justify-content: center; align-items: stretch;
+    gap: 26px; position: relative; z-index: 1;
+  }
+  .rtlayer + .rtlayer { margin-top: 74px; }   /* 留出连线空间 */
+  /* 层间小标题 */
+  .rtlayer-flag {
+    position: absolute; left: 0; top: -20px;
+    font-size: 10.5px; font-weight: 700; letter-spacing: .5px;
+    color: var(--c-txt-3); background: #f4f6f9; border: 1px solid var(--c-line);
+    padding: 1px 8px; border-radius: 999px; white-space: nowrap;
+  }
+
+  /* 分子节点卡 */
+  .rtnode {
+    position: relative; flex: 0 0 auto;
+    display: flex; flex-direction: column;
+    background: #fff; border: 1.5px solid var(--c-line); border-radius: var(--r-md);
+    padding: 8px 10px 9px; box-shadow: var(--sh-1);
+    /* 不要用 transform 做 hover 位移：会让 SVG 连线错位 */
+    transition: box-shadow .18s, border-color .18s;
+  }
+  .rtnode:hover { box-shadow: var(--sh-3); border-color: #c9d7e8; }
+  .rtnode.is-target { border-color: #93b4fb; background: linear-gradient(180deg,#fff 0%,#f5f9ff 100%); }
+  .rtnode.is-target:hover { border-color: #6d9bf8; }
+  .rtnode.is-start  { border-color: #86efac; background: linear-gradient(180deg,#fff 0%,#f3fdf8 100%); }
+  .rtnode.is-start:hover { border-color: #5fd98c; }
+  .rtnode .rt-tag {
+    position: absolute; top: -9px; left: 10px;
+    font-size: 10px; font-weight: 700; letter-spacing: .3px;
+    padding: 2px 8px; border-radius: 999px; white-space: nowrap;
+    background: #eef2f7; color: var(--c-txt-2); border: 1px solid var(--c-line);
+  }
+  .rtnode.is-target .rt-tag { background: var(--c-brand); color: #fff; border-color: var(--c-brand); }
+  .rtnode.is-start  .rt-tag { background: var(--c-ok);   color: #fff; border-color: var(--c-ok); }
+  .rtnode-mol {
+    flex: 1 1 auto; display: flex; align-items: center; justify-content: center; line-height: 0;
+  }
+  .rtnode-smi {
+    font-family: Consolas, "Courier New", monospace; font-size: 10px; color: var(--c-txt-3);
+    max-width: 190px; word-break: break-all; margin: 4px auto 0; text-align: center;
+    line-height: 1.45;
+  }
+  .rtnode-step {
+    margin-top: 5px; font-size: 10.5px; font-weight: 600; color: var(--c-txt-3);
+    text-align: center; border-top: 1px dashed var(--c-line-2); padding-top: 4px;
+  }
+  .rtnode-step b { color: var(--c-brand); font-variant-numeric: tabular-nums; }
+
+  /* 起始物料汇总 */
+  .sm-box {
+    background: linear-gradient(180deg,#f7fdfa 0%,#f0fdf6 100%);
+    border: 1px solid #bbf7d0; border-radius: var(--r-md); padding: 16px 18px;
+  }
+  .sm-title {
+    font-size: 13.5px; font-weight: 700; color: #166534; margin-bottom: 14px;
+    display: flex; align-items: center; gap: 7px;
+  }
+  .sm-list { display: flex; flex-wrap: wrap; gap: 18px; align-items: flex-end; }
+  .sm-item { text-align: center; flex: 0 0 auto; }
+  .sm-smi {
+    font-family: Consolas, monospace; font-size: 10px; color: var(--c-txt-3);
+    max-width: 170px; word-break: break-all; margin-top: 5px; line-height: 1.45;
+  }
+
+  .empty { text-align: center; color: var(--c-txt-3); font-size: 13.5px; padding: 34px 0; line-height: 1.9; }
+  .stats { font-size: 12px; color: var(--c-txt-3); line-height: 1.8; }
+
+  /* 横向滚动条美化：路线图 / 结构图在窄容器下可横向滚动 */
+  .rtmap::-webkit-scrollbar, .draw::-webkit-scrollbar, #parsedDraw::-webkit-scrollbar {
+    height: 9px;
+  }
+  .rtmap::-webkit-scrollbar-track, .draw::-webkit-scrollbar-track, #parsedDraw::-webkit-scrollbar-track {
+    background: #f1f5f9; border-radius: 5px; margin: 0 6px;
+  }
+  .rtmap::-webkit-scrollbar-thumb, .draw::-webkit-scrollbar-thumb, #parsedDraw::-webkit-scrollbar-thumb {
+    background: #cbd5e1; border-radius: 5px;
+  }
+  .rtmap::-webkit-scrollbar-thumb:hover, .draw::-webkit-scrollbar-thumb:hover,
+  #parsedDraw::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+
+  /* 窄屏适配 */
+  @media (max-width: 720px) {
+    header { padding: 20px 18px; }
+    header h1 { font-size: 18px; }
+    header p { font-size: 12px; }
+    .wrap { padding: 18px 12px 56px; }
+    .card { padding: 16px 14px; border-radius: var(--r-sm); }
+    .row > div { min-width: 120px; }
+    .btn { padding: 10px 18px; font-size: 13.5px; }
+    .rtmap { padding: 20px 12px 24px; }
+    .rtlayer { gap: 14px; }
+    .rtlayer + .rtlayer { margin-top: 64px; }
+    .rtnode { padding: 7px 8px 8px; }
+    .rtnode-smi { max-width: 150px; font-size: 9.5px; }
+    .modes label { padding: 5px 9px; font-size: 12.5px; }
+    .tab { padding: 10px 13px; font-size: 13px; }
+    .route-head { padding: 12px 14px; }
+    .subview { padding: 12px 14px 0; }
+    .steps { padding: 13px 12px; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>RetroChimera 逆合成预测</h1>
+  <p>输入目标产物分子 → 预测合成前体，并可视化完整多步合成路径（结构式全程可读）</p>
+</header>
+
+<div class="wrap">
+
+  <!-- ===== 输入区 ===== -->
+  <div class="card">
+    <div class="modes">
+      <span style="font-size:13px;font-weight:600;color:#374151">目标产物输入方式：</span>
+      <label><input type="radio" name="inmode" value="draw" checked> 结构式模式（从 ChemDraw 直接贴）</label>
+      <label><input type="radio" name="inmode" value="smiles"> SMILES 模式</label>
+    </div>
+
+    <!-- 结构式模式 -->
+    <div id="modeDraw">
+      <label for="pasteBox">在此粘贴（Ctrl+V）</label>
+      <textarea id="pasteBox" class="biginput" spellcheck="false"
+        placeholder="从 ChemDraw 复制后，在这里按 Ctrl+V 粘贴。&#10;&#10;支持以下几种粘贴内容：&#10;  1) 选中结构 → Ctrl+C 复制的 ChemDraw 图形（CDXML，推荐）&#10;  2) 在 ChemDraw 里选中结构 → 右键 Copy As → SMILES / InChI&#10;  3) SMILES 纯文本（直接粘也行，自动识别）&#10;&#10;也可以用鼠标把文件拖进来，或点下面的「选择文件」导入 .cdxml / .mol / .sdf"></textarea>
+      <div class="hint">
+        <b>ChemDraw 推荐操作：</b>选中结构 → <b>Ctrl+C</b> → 回到这里 <b>Ctrl+V</b>，下方会自动解析出结构式和 SMILES。<br>
+        若粘贴后没反应，说明这份 ChemDraw 版本把图形写成了私有二进制格式，请改用
+        <b>右键 Copy As → SMILES</b>，或 <b>File → Save As → CDXML</b> 后拖到此处。
+      </div>
+
+      <div class="row" style="margin-top:12px">
+        <div style="flex:0 0 auto">
+          <button class="btn ghost" id="fileBtn" type="button">选择文件（.cdxml / .mol / .sdf）</button>
+          <input type="file" id="fileInput" accept=".cdxml,.mol,.sdf,.smi,.smiles,.txt,.xml" style="display:none">
+        </div>
+        <div style="flex:0 0 auto">
+          <button class="btn ghost" id="clearBtn" type="button">清空</button>
+        </div>
+      </div>
+
+      <div class="parsed" id="parsedBox" style="display:none">
+        <div class="parsed-head">
+          <span>✔ 已识别</span>
+          <span class="pill" id="parsedKind">CDXML</span>
+          <span class="pill gray" id="parsedInfo"></span>
+        </div>
+        <div class="parsed-smi" id="parsedSmi"></div>
+        <div id="parsedDraw" style="margin-top:12px;text-align:center"></div>
+      </div>
+
+      <div class="err" id="parseErr" style="display:none;margin-top:14px"></div>
+    </div>
+
+    <!-- SMILES 模式 -->
+    <div id="modeSmiles" style="display:none">
+      <label for="smiles">目标产物 SMILES</label>
+      <input type="text" id="smiles" placeholder="例如：Oc1ccc(OCc2ccccc2)c(Br)c1" autocomplete="off">
+      <div class="hint">
+        原子编号可以省略，如 <b>苯甲醛</b> 直接写 <b>O=Cc1ccccc1</b>，不用写成 <b>[CH]1=[CH][CH]...</b>。
+        输入后会实时校验，有问题立刻提示。
+      </div>
+      <div class="err" id="smilesErr" style="display:none;margin-top:12px"></div>
+    </div>
+
+    <div class="examples">
+      快速示例：
+      <span class="chip" data-smi="Oc1ccc(OCc2ccccc2)c(Br)c1">溴代苄醚苯酚</span>
+      <span class="chip" data-smi="CC(=O)Oc1ccccc1C(=O)O">阿司匹林</span>
+      <span class="chip" data-smi="CC(=O)Nc1ccc(O)cc1">对乙酰氨基酚</span>
+      <span class="chip" data-smi="CN1C=NC2=C1C(=O)N(C)C(=O)N2C">咖啡因</span>
+      <span class="chip" data-smi="COc1ccc2cc(ccc2c1)C(C)C(=O)O">萘普生</span>
+    </div>
+
+    <div class="row" style="margin-top:16px">
+      <div style="flex:0 0 180px">
+        <label for="model">模型</label>
+        <select id="model">
+          <option value="pistachio">Pistachio（主推）</option>
+          <option value="uspto50k">USPTO-50K（基准）</option>
+        </select>
+      </div>
+      <div style="flex:0 0 auto">
+        <button class="btn sec" id="loadBtn">加载模型</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== 标签页 ===== -->
+  <div class="tabs">
+    <button class="tab active" data-panel="single">单步预测（前体）</button>
+    <button class="tab" data-panel="multi">多步合成路径</button>
+  </div>
+
+  <!-- 单步面板 -->
+  <div class="panel active" id="panel-single">
+    <div class="card">
+      <div class="row">
+        <div style="flex:0 0 150px">
+          <label for="num">结果数量</label>
+          <input type="number" id="num" value="5" min="1" max="20">
+        </div>
+        <div style="flex:0 0 auto">
+          <button class="btn" id="goBtn">开始预测前体</button>
+        </div>
+      </div>
+      <div class="toggle">
+        <input type="checkbox" id="showRxn" checked>
+        <label for="showRxn">用完整反应式结构图（前体 + 前体 → 产物）展示；取消则把前体与产物<strong>分行</strong>单独画出（分子更大）</label>
+      </div>
+      <div id="status1" style="font-size:13.5px;margin-top:14px;min-height:20px"></div>
+    </div>
+
+    <div class="card" id="resultCard" style="display:none">
+      <div class="warn">
+        模型可能产生幻觉结果：排名越靠后越可能是错误反应。官方建议单个产物最多请求 5–10 个结果，
+        任何预测在用于真实实验前必须经化学专家验证。
+      </div>
+      <div class="meta" id="meta"></div>
+      <div id="results"></div>
+    </div>
+  </div>
+
+  <!-- 多步面板 -->
+  <div class="panel" id="panel-multi">
+    <div class="card">
+      <div class="row">
+        <div style="flex:0 0 120px">
+          <label for="max_routes">路径条数</label>
+          <input type="number" id="max_routes" value="3" min="1" max="10">
+        </div>
+        <div style="flex:0 0 120px">
+          <label for="max_depth">最大步数</label>
+          <input type="number" id="max_depth" value="3" min="1" max="6">
+        </div>
+        <div style="flex:0 0 140px">
+          <label for="max_calls">搜索预算</label>
+          <input type="number" id="max_calls" value="60" min="5" max="400">
+        </div>
+        <div style="flex:0 0 150px">
+          <label for="max_heavy_atoms">起始物料上限<br><span style="font-weight:400;font-size:11px;color:#9ca3af">重原子数，越小越接近真实试剂</span></label>
+          <input type="number" id="max_heavy_atoms" value="10" min="1" max="40">
+        </div>
+        <div style="flex:0 0 auto">
+          <button class="btn" id="searchBtn">搜索合成路径</button>
+        </div>
+      </div>
+
+      <div class="matrow">
+        <div class="matfield">
+          <label for="startMats">指定起始物料（可选）</label>
+          <input type="text" id="startMats" placeholder="有现成试剂就填这里，多个用逗号分隔；留空则只按重原子数判断">
+        </div>
+        <label class="chk"><input type="checkbox" id="requireMats"> 仅保留包含上述原料的路线</label>
+        <div class="hint">填写的分子会被当作「可直接购买」——搜索到此终止、不再继续往下拆。勾选右侧复选框后，只显示真正用到这些原料的路线（前提是搜索确实探索到了该分支）。</div>
+      </div>
+
+      <div id="status2" style="font-size:13.5px;margin-top:14px;min-height:20px"></div>
+    </div>
+
+    <div id="routesBox"></div>
+    <div id="smBox"></div>
+  </div>
+
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+
+/* ================= 标签页 ================= */
+document.querySelectorAll('.tab').forEach(t => {
+  t.onclick = () => {
+    document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+    document.querySelectorAll('.panel').forEach(x => x.classList.remove('active'));
+    t.classList.add('active');
+    $('panel-' + t.dataset.panel).classList.add('active');
+  };
+});
+
+document.querySelectorAll('.chip').forEach(c => {
+  c.onclick = () => {
+    // 点示例 → 自动切到 SMILES 模式并填值（示例本身就是 SMILES）
+    const r = document.querySelector('input[name=inmode][value=smiles]');
+    if (r) { r.checked = true; setMode('smiles'); }
+    $('smiles').value = c.dataset.smi;
+    $('smiles').focus();
+  };
+});
+
+/* ================= 输入方式切换 ================= */
+let INMODE = 'draw';          // 'draw' | 'smiles'
+let PARSED_SMILES = '';       // 结构式模式解析出的 SMILES
+
+function setMode(m) {
+  INMODE = m;
+  $('modeDraw').style.display   = (m === 'draw')   ? 'block' : 'none';
+  $('modeSmiles').style.display = (m === 'smiles') ? 'block' : 'none';
+  // 切走时收起另一个模式的错误提示，避免误读
+  if (m === 'smiles') {
+    const eb = $('parseErr'); if (eb) { eb.style.display = 'none'; eb.innerHTML = ''; }
+  } else {
+    const se = $('smilesErr'); if (se) { se.style.display = 'none'; se.innerHTML = ''; }
+  }
+}
+document.querySelectorAll('input[name=inmode]').forEach(r => {
+  r.onchange = () => { if (r.checked) setMode(r.value); };
+});
+
+/** 统一取用当前目标分子：结构式模式优先用解析结果 */
+function currentSmiles() {
+  const v = (INMODE === 'draw') ? PARSED_SMILES : $('smiles').value.trim();
+  return (v || '').trim();
+}
+
+/* SMILES 模式：输入后实时校验，有问题立刻提示 */
+(function () {
+  const el = document.getElementById('smiles');
+  const box = document.getElementById('smilesErr');
+  if (!el || !box) return;
+  let timer = null;
+
+  el.addEventListener('input', () => {
+    clearTimeout(timer);
+    box.style.display = 'none';
+    box.innerHTML = '';
+    const v = el.value.trim();
+    if (!v) return;
+    timer = setTimeout(async () => {
+      let r;
+      try {
+        r = await post('/api/parse', { text: v });
+      } catch (e) { return; }
+      if (!r || r.ok) {
+        if (r && r.ok) {
+          // 显示规范化结果（鼠标移上去可见）
+          el.title = '规范写法：' + r.smiles + (r.formula ? '　' + r.formula : '');
+        }
+        return;
+      }
+      // 非法：显示诊断
+      const reasons = Array.isArray(r.reasons) ? r.reasons : [];
+      const sugs = Array.isArray(r.suggestions) ? r.suggestions : [];
+      let h = '<div style="font-weight:700;margin-bottom:7px">✖ ' + esc(r.error || '这个结构有问题') + '</div>';
+      if (reasons.length) {
+        h += '<ul style="margin:0 0 10px 20px;padding:0">';
+        reasons.forEach(x => { h += '<li style="margin-bottom:4px">' + esc(x) + '</li>'; });
+        h += '</ul>';
+      }
+      const good = sugs.filter(s => s.valid);
+      if (good.length) {
+        h += '<div style="margin-bottom:7px"><b>可用的修正（点一下填入）：</b></div>';
+        h += '<div id="smilesSugList" style="display:flex;flex-direction:column;gap:6px"></div>';
+      } else if (sugs.length) {
+        h += '<div style="font-size:12px;color:#6b7280">这些改法也都不成立，说明这个骨架本身有问题，' +
+             '请回 ChemDraw 检查结构（尤其是 R 基团/通用取代基）。</div>';
+      }
+      box.innerHTML = h;
+      box.style.display = 'block';
+
+      if (good.length) {
+        const list = document.getElementById('smilesSugList');
+        good.forEach(sg => {
+          const row = document.createElement('div');
+          row.style.cssText = 'display:flex;align-items:center;gap:10px;flex-wrap:wrap';
+          const btn = document.createElement('button');
+          btn.className = 'btn sec';
+          btn.type = 'button';
+          btn.style.cssText = 'padding:6px 13px;font-size:12.5px';
+          btn.textContent = sg.label + ' ✔';
+          btn.onclick = () => {
+            el.value = sg.canonical || sg.smiles;
+            box.style.display = 'none';
+            box.innerHTML = '';
+            toast('已填入修正后的结构', 'ok');
+          };
+          row.appendChild(btn);
+          const code = document.createElement('code');
+          code.style.cssText = 'font-size:11.5px;color:#4b5563;word-break:break-all;flex:1;min-width:180px';
+          code.textContent = sg.smiles;
+          row.appendChild(code);
+          list.appendChild(row);
+        });
+      }
+    }, 500);
+  });
+})();
+
+/** 从任意文本里抢救 SMILES（识别模糊时兜底） */
+function guessSmilesFromText(txt) {
+  const t = String(txt || '').trim();
+  if (!t || t.length > 2000) return '';
+  // 典型 SMILES 字符集；排除明显是 XML/JSON 的内容
+  if (/^[A-Za-z0-9@+\-\[\]\(\)=#$:\/\\%\.\*]+$/.test(t)) return t;
+  return '';
+}
+
+/* ================= 结构解析（交给后端 RDKit） =================
+   浏览器端不做分子图推理，直接把粘贴的文本发给 /api/parse，
+   后端用 RDKit 2023.09.6 解析（原生支持 ChemDraw 的 CDXML）。
+   这样芳香性、立构、电荷、糖环等都能正确处理。
+*/
+
+/* --- 粘贴处理 --- */
+/* --- 粘贴处理 --- */
+(function () {
+  const box = document.getElementById('pasteBox');
+  if (!box) return;
+
+  box.addEventListener('paste', () => {
+    // 等浏览器把内容填进去再解析
+    setTimeout(() => handlePastedText(box.value), 30);
+  });
+
+  let timer = null;
+  box.addEventListener('input', () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => handlePastedText(box.value), 400);
+  });
+
+  box.addEventListener('dragover', e => { e.preventDefault(); box.classList.add('drag'); });
+  box.addEventListener('dragleave', () => box.classList.remove('drag'));
+  box.addEventListener('drop', e => {
+    e.preventDefault(); box.classList.remove('drag');
+    const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+    if (f) readStructureFile(f);
+  });
+})();
+
+/* 选择文件 */
+$('fileBtn') && ($('fileBtn').onclick = () => $('fileInput').click());
+$('fileInput') && ($('fileInput').onchange = e => {
+  const f = e.target.files && e.target.files[0];
+  if (f) readStructureFile(f);
+});
+
+$('clearBtn') && ($('clearBtn').onclick = () => {
+  $('pasteBox').value = '';
+  PARSED_SMILES = '';
+  $('parsedBox').style.display = 'none';
+  $('parsedDraw').innerHTML = '';
+  toast('已清空', 'info');
+});
+
+function readStructureFile(f) {
+  const ext = (f.name.split('.').pop() || '').toLowerCase();
+  const isText = ['cdxml', 'mol', 'sdf', 'smi', 'smiles', 'txt', 'xml'].includes(ext);
+  if (!isText) {
+    toast('不支持的文件类型：.' + ext + '（请用 .cdxml / .mol / .sdf）', 'error');
+    return;
+  }
+  const rd = new FileReader();
+  rd.onload = () => {
+    $('pasteBox').value = rd.result;
+    handlePastedText(rd.result);
+  };
+  rd.onerror = () => toast('文件读取失败', 'error');
+  rd.readAsText(f, 'UTF-8');
+}
+
+async function handlePastedText(text) {
+  const pbox = $('parsedBox');
+  const ebox = $('parseErr');
+  const t = String(text || '').trim();
+
+  if (!t) {
+    PARSED_SMILES = '';
+    pbox.style.display = 'none';
+    if (ebox) { ebox.style.display = 'none'; ebox.innerHTML = ''; }
+    $('parsedDraw').innerHTML = '';
+    return;
+  }
+
+  // 显示"解析中"
+  if (ebox) { ebox.style.display = 'none'; ebox.innerHTML = ''; }
+
+  let r;
+  try {
+    r = await post('/api/parse', { text: t });
+  } catch (e) {
+    r = { ok: false, error: '解析请求失败：' + e };
+  }
+
+  if (!r || !r.ok) {
+    PARSED_SMILES = '';
+    pbox.style.display = 'none';
+    $('parsedDraw').innerHTML = '';
+    renderParseError(ebox, r || { error: '未知错误' }, t);
+    return;
+  }
+
+  PARSED_SMILES = r.smiles;
+  pbox.style.display = 'block';
+  $('parsedKind').textContent = r.kind || '自动识别';
+  const extras = [];
+  if (r.atoms) extras.push(r.atoms + ' 个原子');
+  if (r.formula) extras.push(r.formula);
+  if (r.mw) extras.push('MW ' + r.mw);
+  $('parsedInfo').textContent = extras.join(' · ');
+  $('parsedSmi').textContent = r.smiles;
+
+  // 结构式预览：走统一的「恒定键长」逻辑。这里是展示重点，键长给大一些。
+  const dbox = $('parsedDraw');
+  dbox.innerHTML = '';
+  try {
+    drawMolecule(dbox, r.smiles, { bondPx: 40, minPx: 130, maxPx: 460 });
+  } catch (e) {
+    dbox.innerHTML = '<span style="font-size:12px;color:#b45309">结构式预览失败，但 SMILES 已识别：'
+      + esc(r.smiles) + '</span>';
+  }
+  toast('已识别为 ' + (r.kind || '结构') + '，可以开始预测', 'ok');
+}
+
+/* 预测/搜索失败：把后端的诊断和修复候选渲染到状态栏 */
+function renderFail(statusEl, d, action) {
+  const reasons = Array.isArray(d.reasons) ? d.reasons : [];
+  const sugs = Array.isArray(d.suggestions) ? d.suggestions : [];
+
+  let h = '<div class="err" style="text-align:left">';
+  h += '<div style="font-weight:700;margin-bottom:8px">✖ ' + esc(action) + '失败</div>';
+  if (d.error) h += '<div style="margin-bottom:8px">' + esc(d.error) + '</div>';
+
+  if (reasons.length) {
+    h += '<div style="margin-bottom:6px"><b>原因：</b></div><ul style="margin:0 0 10px 20px;padding:0">';
+    reasons.forEach(x => { h += '<li style="margin-bottom:4px">' + esc(x) + '</li>'; });
+    h += '</ul>';
+  }
+
+  if (sugs.length) {
+    h += '<div style="margin:6px 0 8px"><b>可以试试这些修正（点一下直接采用）：</b></div>';
+    h += '<div id="failSugList" style="display:flex;flex-direction:column;gap:6px;margin-bottom:10px"></div>';
+  }
+
+  // 底部提示按失败类型区分：R 基团问题 vs 键级/芳香性问题
+  const isKekule = /kekulize|芳香环|键级/i.test((d.error || '') + reasons.join(' '));
+  let tip;
+  if (isKekule) {
+    tip = '<b>常见画法问题（芳香环键级对不上）：</b><br>' +
+      '· 环上的<b>杂原子价态</b>可能不对（例如 N 成了四价、O 成了一价带双键）。<br>' +
+      '· 某个环可能被画成了<b>芳香键 + 双键混用</b>，导致 RDKit 无法分配单/双键。<br>' +
+      '· 从 ChemDraw 粘贴后，请回到原结构检查：<b>苯环/杂环上的双键位置、氢原子、形式电荷</b>。<br>' +
+      '· 一个常用排查法：在 ChemDraw 里右键 → <b>Copy As → SMILES</b>，把得到的 SMILES 贴到 SMILES 模式，看能否通过校验。';
+  } else {
+    tip = '<b>在 ChemDraw 里怎么处理：</b><br>' +
+      '· 结构里的 <b>R 基团 / 通用取代基</b>（R1、R2、"F,Cl,Br,I" 这类）必须先替换成<b>具体原子</b>。<br>' +
+      '· 逆合成预测需要<b>一个确定的目标分子</b>——用通用结构算不出有意义的路径。<br>' +
+      '· 复制时优先 <b>右键 → Copy As → SMILES</b>；或 <b>File → Save As → CDXML</b> 后把文件拖进输入框。';
+  }
+
+  h += '<div style="font-size:12px;line-height:1.75;color:#6b7280;border-top:1px solid #fecaca;padding-top:9px">' +
+    tip + '</div></div>';
+
+  statusEl.innerHTML = h;
+
+  if (sugs.length) {
+    const list = document.getElementById('failSugList');
+    sugs.forEach(sg => {
+      const row = document.createElement('div');
+      row.style.cssText = 'display:flex;align-items:center;gap:10px;flex-wrap:wrap';
+
+      const use = document.createElement('button');
+      use.className = 'btn ' + (sg.valid ? 'sec' : 'ghost');
+      use.type = 'button';
+      use.style.cssText = 'padding:7px 14px;font-size:12.5px';
+      use.textContent = sg.label + (sg.valid ? ' ✔ 可用' : '（仍不成立）');
+      use.disabled = !sg.valid;
+      if (sg.valid) {
+        use.onclick = () => {
+          const radio = document.querySelector('input[name=inmode][value=smiles]');
+          if (radio) { radio.checked = true; setMode('smiles'); }
+          $('smiles').value = sg.canonical || sg.smiles;
+          statusEl.innerHTML = '<span style="color:#059669;font-weight:600">✔ 已填入修正后的结构，可以重新点' +
+            esc(action) + '</span>';
+          toast('已采用修正后的结构', 'ok');
+        };
+      }
+      row.appendChild(use);
+
+      const code = document.createElement('code');
+      code.style.cssText = 'font-size:11.5px;color:#4b5563;word-break:break-all;flex:1;min-width:200px';
+      code.textContent = sg.smiles.slice(0, 110) + (sg.smiles.length > 110 ? '…' : '');
+      row.appendChild(code);
+      list.appendChild(row);
+    });
+  }
+}
+
+/* 渲染解析失败：说明原因 + 可一键采用的修复候选 */
+function renderParseError(ebox, r, rawText) {
+  if (!ebox) {
+    toast(r.error || '解析失败', 'error');
+    return;
+  }
+  const reasons = Array.isArray(r.reasons) ? r.reasons : [];
+  const sugs = Array.isArray(r.suggestions) ? r.suggestions : [];
+
+  let h = '<div style="font-weight:700;margin-bottom:8px">✖ 无法识别这个结构</div>';
+  if (r.error) h += '<div style="margin-bottom:8px">' + esc(r.error) + '</div>';
+  if (reasons.length) {
+    h += '<div style="margin-bottom:8px"><b>原因：</b></div><ul style="margin:0 0 10px 20px;padding:0">';
+    reasons.forEach(x => { h += '<li style="margin-bottom:4px">' + esc(x) + '</li>'; });
+    h += '</ul>';
+  }
+
+  if (sugs.length) {
+    h += '<div style="margin-bottom:6px"><b>可以试试这些修正（点一下直接采用）：</b></div>';
+    h += '<div id="sugList" style="display:flex;flex-direction:column;gap:6px"></div>';
+  }
+
+  h += '<div style="margin-top:10px;font-size:12px;line-height:1.75;color:#6b7280">' +
+    '<b>在 ChemDraw 里怎么处理：</b><br>' +
+    '· 如果结构里有 <b>R 基团 / 通用取代基</b>（如 R1、R2、"F,Cl,Br,I"），先把它们替换成<b>具体的原子</b>——' +
+    '逆合成预测需要确定的目标分子，通用结构无法计算。<br>' +
+    '· 复制时优先用 <b>右键 → Copy As → SMILES</b>，比直接 Ctrl+C 的 CDXML 更干净。<br>' +
+    '· 如果要从头画，选中结构后 <b>File → Save As → CDXML</b>，再把 .cdxml 文件拖进上面的框。' +
+    '</div>';
+
+  ebox.innerHTML = h;
+  ebox.style.display = 'block';
+
+  // 绑定修复候选按钮
+  if (sugs.length) {
+    const list = document.getElementById('sugList');
+    sugs.forEach(sg => {
+      const row = document.createElement('div');
+      row.style.cssText = 'display:flex;align-items:center;gap:10px;flex-wrap:wrap';
+
+      const use = document.createElement('button');
+      use.className = 'btn ' + (sg.valid ? 'sec' : 'ghost');
+      use.type = 'button';
+      use.style.cssText = 'padding:7px 14px;font-size:12.5px';
+      use.textContent = sg.label + (sg.valid ? ' ✔' : '（仍不成立）');
+      use.disabled = !sg.valid;
+      if (sg.valid) {
+        use.onclick = () => {
+          // 切到 SMILES 模式并填入修正后的结构
+          const radio = document.querySelector('input[name=inmode][value=smiles]');
+          if (radio) { radio.checked = true; setMode('smiles'); }
+          $('smiles').value = sg.canonical || sg.smiles;
+          PARSED_SMILES = '';
+          $('parsedBox').style.display = 'none';
+          ebox.style.display = 'none';
+          toast('已采用修正后的结构，可以点预测了', 'ok');
+          $('goBtn') && $('goBtn').scrollIntoView({ behavior: 'smooth', block: 'center' });
+        };
+      }
+      row.appendChild(use);
+
+      const code = document.createElement('code');
+      code.style.cssText = 'font-size:11.5px;color:#4b5563;word-break:break-all;flex:1;min-width:200px';
+      code.textContent = sg.smiles.slice(0, 120) + (sg.smiles.length > 120 ? '…' : '');
+      row.appendChild(code);
+      list.appendChild(row);
+    });
+  }
+}
+
+/* ================= 结构式绘制（已验证的正确 API） =================
+     - 构造函数只接收「配置对象」，不要传 DOM 容器
+     - drawer.draw(smiles, target, theme, successCb, errorCb, weights)
+     - target 必须是：
+         a) 一个真实的 <svg> 元素对象（最稳），或
+         b) null（库自己创建 SVG 并通过 successCb 回传），或
+         c) 一个 CSS 选择器字符串，且必须命中 svg/canvas/img 标签
+       ❌ 传 <div> 元素对象 → querySelectorAll 报错
+       ❌ 传 <div> 的 id 字符串 → querySelectorAll 命中 div，
+          库的三条分支(svg/canvas/img)都不匹配 → 静默什么都不画
+
+   ⚠️ 关于尺寸（实测结论，别再踩）：
+     SmilesDrawer 的 SVG 渲染会 **忽略传入的 width / height**，由它自己把
+     viewBox 设成紧贴分子的正方形（填充率 0.76–0.95，已经足够紧凑）。
+     而 SVG 若没有 width/height 属性，就会被 flex + CSS 压成 20 多像素
+     —— 实测线上每个结构式只有 22×22 px、分子本体仅 14–41 px，这才是
+     「结构式画得太小」的真正原因（不是参数调小了）。
+     因此：画完后按「恒定键长」写入明确的像素尺寸。
+============================================================ */
+
+/* 字号适当放大；尺寸由 fitSvg() 按恒定键长决定，这里不再传 width/height */
+const MOL_OPTS = {
+  bondThickness: 1.15,
+  bondLength: 24,
+  shortBondLength: 0.86,
+  bondSpacing: 24 * 0.18,
+  atomVisualization: 'default',
+  terminalCarbons: false,
+  explicitHydrogens: false,
+  compactDrawing: true,
+  padding: 8,
+  fontSizeLarge: 11,
+  fontSizeSmall: 8,
+  overlapSensitivity: 0.42,
+  isomeric: true,
+};
+
+const THEME = 'light';
+
+/* viewBox 里「1 个单键」等于多少用户单位 —— 与 MOL_OPTS.bondLength 保持一致 */
+const BOND_UNIT = MOL_OPTS.bondLength;
+
+/* 单键在屏幕上应有的像素长度（所有分子统一，视觉才协调） */
+const BOND_PX_DEFAULT = 34;
+
+function molDrawer() {
+  return new SmilesDrawer.SmiDrawer(Object.assign({}, MOL_OPTS));
+}
+
+/** 读出库设置的 viewBox（紧贴分子的包围盒） */
+function getViewBox(svg) {
+  try {
+    const vb = svg.viewBox && svg.viewBox.baseVal;
+    if (vb && vb.width > 0 && vb.height > 0) return vb;
+  } catch (e) { /* ignore */ }
+  return null;
+}
+
+/**
+ * 按「恒定键长」给 SVG 写入明确像素尺寸。
+ * - bondPx：目标屏幕键长（px）
+ * - minPx ：单边最小像素 —— 极小分子（Br2 / HCl 这类试剂）也要看得清
+ * - maxPx ：单边最大像素 —— 防止超大分子撑爆布局
+ * 窄屏（<720px）会自动收敛到视口宽度内，避免横向溢出。
+ */
+function fitSvg(svg, opts) {
+  const o = Object.assign({ bondPx: BOND_PX_DEFAULT, minPx: 120, maxPx: 430 }, opts || {});
+  const vb = getViewBox(svg);
+  if (!vb) return;
+
+  let scale = o.bondPx / BOND_UNIT;
+  const longer = Math.max(vb.width, vb.height);
+
+  if (longer * scale > o.maxPx) scale = o.maxPx / longer;   // 上限
+  if (longer * scale < o.minPx) scale = o.minPx / longer;   // 下限（小分子兜底）
+
+  if (window.innerWidth < 720) {                            // 窄屏收敛
+    const cap = Math.max(140, window.innerWidth - 104);
+    if (vb.width * scale > cap) scale = cap / vb.width;
+  }
+
+  const w = Math.round(vb.width * scale);
+  const h = Math.round(vb.height * scale);
+
+  // 属性 + inline style 双保险：inline style 优先级高于 .draw svg{max-width:100%}
+  svg.setAttribute('width', w);
+  svg.setAttribute('height', h);
+  svg.style.width = w + 'px';
+  svg.style.height = h + 'px';
+  svg.style.maxWidth = 'none';
+  svg.style.flex = 'none';
+  svg.setAttribute('preserveAspectRatio', 'xMidYMid meet');
+
+  // 记录参数，供窗口 resize 时用同一套约束重算（否则会退化成默认上限）
+  svg.dataset.bondpx = o.bondPx;
+  svg.dataset.minpx = o.minPx;
+  svg.dataset.maxpx = o.maxPx;
+}
+
+/**
+ * 把一个 SMILES 画进 container（会自动创建 <svg> 并插入）。
+ * opts: { bondPx, maxPx } —— 控制分子显示大小
+ * 返回 true/false。
+ */
+function drawMolecule(container, smiles, opts) {
+  opts = opts || {};
+  container.innerHTML = '';
+  if (!smiles) { container.innerHTML = '<span class="stats">（无）</span>'; return false; }
+  let ok = false;
+
+  try {
+    const svgEl = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    container.appendChild(svgEl);
+    molDrawer().draw(
+      smiles,
+      svgEl,                 // ← 传真实 SVG 元素，最可靠
+      THEME,
+      function () { ok = true; fitSvg(svgEl, opts); },
+      function (err) {
+        container.innerHTML = '<div style="color:#b91c1c;font-size:11.5px;padding:10px">'
+          + '结构式渲染失败：' + esc(err && err.message ? err.message : err) + '</div>';
+      },
+      null
+    );
+    // 兜底：个别版本 successCallback 不触发，这里补一次（幂等）
+    if (!svgEl.hasAttribute('width')) fitSvg(svgEl, opts);
+  } catch (e) {
+    container.innerHTML = '<div style="color:#b91c1c;font-size:11.5px;padding:10px">'
+      + '结构式渲染异常：' + esc(e && e.message ? e.message : e) + '</div>';
+    return false;
+  }
+
+  // 同步校验是否真的画出了图元
+  const n = container.querySelectorAll('path,line,text,ellipse').length;
+  if (!ok && n === 0) {
+    container.innerHTML = '<span class="stats">结构式未生成（库返回空图）</span>';
+    return false;
+  }
+  return true;
+}
+
+/** 窄屏旋转/缩放后重新适配所有已画好的结构式 + 重画路线图连线 */
+let _refitTimer = null;
+window.addEventListener('resize', () => {
+  clearTimeout(_refitTimer);
+  _refitTimer = setTimeout(() => {
+    document.querySelectorAll('.draw svg, #parsedDraw svg, .rtnode-mol svg, .sm-item svg')
+      .forEach(svg => {
+        if (!svg.hasAttribute('data-bondpx')) return;
+        fitSvg(svg, {
+          bondPx: +svg.dataset.bondpx,
+          minPx:  +svg.dataset.minpx || 96,
+          maxPx:  +svg.dataset.maxpx || 430,
+        });
+      });
+    document.querySelectorAll('.rtmap').forEach(h => drawTreeLines(h));
+  }, 220);
+});
+
+
+/** 多组分 SMILES（A.B）拆成 [{smi}] 列表 */
+function splitParts(smiles) {
+  return String(smiles || '').split('.').map(s => s.trim()).filter(Boolean);
+}
+
+/**
+ * 画「反应物 + 产物」一行：reactants(可多个) --→ product
+ * opts: { productIsTarget:bool, startSet:Set<string>, bondPx:number }
+ * 每个分子按恒定键长显示；一行放不下时自动换行（CSS flex-wrap），
+ * 不会再像以前那样被挤成 20 多像素。
+ */
+function drawReactionLine(container, reactantSmiles, productSmiles, opts) {
+  opts = opts || {};
+  container.innerHTML = '';
+  const line = document.createElement('div');
+  line.className = 'rxnline';
+  container.appendChild(line);
+
+  const parts = splitParts(reactantSmiles);
+
+  // 按一行里的分子个数自适应键长：分子少就画大些，充分利用横向空间。
+  // （用户的核心诉求就是「结构式太小」，所以宁可换行也要看清。）
+  const n = parts.length + 1;
+  const auto = n <= 1 ? 48 : (n === 2 ? 42 : (n === 3 ? 37 : (n === 4 ? 33 : 30)));
+  const bondPx = opts.bondPx || auto;
+
+  parts.forEach((smi, i) => {
+    if (i > 0) {
+      line.appendChild(opCell('+'));
+    }
+    const isStart = opts.startSet && opts.startSet.has(smi);
+    line.appendChild(molCell(smi, isStart ? '起始物料' : '前体', isStart ? 'start' : '', { bondPx: bondPx, minPx: 120 }));
+  });
+
+  line.appendChild(opCell('→', 'arrow'));
+
+  line.appendChild(molCell(
+    productSmiles,
+    opts.productIsTarget ? '目标产物' : '中间体',
+    opts.productIsTarget ? 'target' : '',
+    { bondPx: bondPx, minPx: 120 }
+  ));
+  return true;
+}
+
+/**
+ * 生成一个「上方标签 + 下方结构图」的单元格。
+ * 用 flex 列布局 + last-child 撑满：标签固定在顶部，分子在剩余空间垂直居中。
+ * 这样同一行的所有标签横向对齐，所有分子中心也对齐。
+ */
+function molCell(smiles, label, labelCls, drawOpts) {
+  const cell = document.createElement('div');
+  cell.className = 'molcell';
+  const tag = document.createElement('div');
+  tag.className = 'moltag' + (labelCls ? ' ' + labelCls : '');
+  tag.textContent = label;
+  cell.appendChild(tag);
+  const box = document.createElement('div');
+  cell.appendChild(box);
+  // 立即绘制：cell 已通过 appendChild 进入行内，但尚未连到 document，
+  // SmilesDrawer 传 SVG 元素对象时不需要在 document 中，故可直接画
+  drawMolecule(box, smiles, drawOpts);
+  return cell;
+}
+
+/**
+ * +/→ 等运算符：刻意复用与 molCell 完全相同的 DOM 结构
+ * （隐形标签 + 内容区），这样它的垂直中心会自动与分子中心重合，
+ * 无需依赖「标签高度 = 24px」这类硬编码。
+ */
+function opCell(text, extraCls) {
+  const cell = document.createElement('div');
+  cell.className = 'molcell op' + (extraCls ? ' ' + extraCls : '');
+  const spacer = document.createElement('div');
+  spacer.className = 'moltag';
+  spacer.textContent = '\u00A0';
+  cell.appendChild(spacer);
+  const box = document.createElement('div');
+  box.className = 'op-box';
+  box.textContent = text;
+  cell.appendChild(box);
+  return cell;
+}
+
+/* ================= 通用请求 ================= */
+async function post(url, body) {
+  const r = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  return r.json();
+}
+
+/* ================= 加载模型 ================= */
+$('loadBtn').onclick = async () => {
+  const model = $('model').value;
+  $('loadBtn').disabled = true;
+  const msg = '<span class="spinner"></span>正在加载模型 ' + model + '（首次需 30–90 秒）...';
+  $('status1').innerHTML = msg; $('status2').innerHTML = msg;
+  try {
+    const d = await post('/api/load', { model });
+    if (d.ok) {
+      const ok = '<span style="color:#059669;font-weight:600">✔ 模型已就绪</span>'
+        + ' &nbsp;设备：' + d.device + ' &nbsp;耗时：' + d.seconds + 's';
+      $('status1').innerHTML = ok; $('status2').innerHTML = ok;
+    } else {
+      $('status1').innerHTML = '<div class="err">加载失败：' + esc(d.error) + '</div>';
+      $('status2').innerHTML = $('status1').innerHTML;
+    }
+  } catch (e) {
+    $('status1').innerHTML = '<div class="err">请求失败：' + esc(e) + '</div>';
+    $('status2').innerHTML = $('status1').innerHTML;
+  } finally {
+    $('loadBtn').disabled = false;
+  }
+};
+
+/* ================= 单步预测 ================= */
+$('goBtn').onclick = async () => {
+  const smiles = currentSmiles();
+  if (!smiles) {
+    $('status1').innerHTML = '<div class="err">' + (INMODE === 'draw'
+      ? '请先粘贴 ChemDraw 结构（或 CDXML / SMILES 文本）'
+      : '请先输入目标分子的 SMILES') + '</div>';
+    return;
+  }
+  $('goBtn').disabled = true;
+  $('resultCard').style.display = 'none';
+  $('status1').innerHTML = '<span class="spinner"></span>正在预测（含模型加载，约 10–90 秒）...';
+  try {
+    const d = await post('/api/predict', {
+      smiles,
+      model: $('model').value,
+      num_results: parseInt($('num').value) || 5,
+    });
+    if (!d.ok) { renderFail($('status1'), d, '预测'); return; }
+    renderSingle(d);
+    $('status1').innerHTML = '<span style="color:#059669;font-weight:600">✔ 预测完成</span>';
+  } catch (e) {
+    $('status1').innerHTML = '<div class="err">请求失败：' + esc(e) + '</div>';
+  } finally {
+    $('goBtn').disabled = false;
+  }
+};
+
+function renderSingle(d) {
+  $('resultCard').style.display = 'block';
+  $('meta').innerHTML = '目标产物：' + esc(d.product) + ' &nbsp;|&nbsp; 模型：' + esc(d.model)
+    + ' &nbsp;|&nbsp; 加载 ' + d.load_seconds + 's &nbsp;|&nbsp; 推理 ' + d.infer_seconds + 's'
+    + (d.note ? '<br><span style="color:#b45309">' + esc(d.note) + '</span>' : '');
+
+  const box = $('results');
+  box.innerHTML = '';
+  const labels = { high: '高置信度', mid: '中等置信度', low: '低置信度 / 可能有幻觉' };
+  const useRxn = $('showRxn').checked;
+
+  d.results.forEach(r => {
+    const div = document.createElement('div');
+    div.className = 'result ' + r.level;
+    const head = document.createElement('div');
+    head.className = 'rhead';
+    head.innerHTML = '<span class="rank">#' + r.rank
+      + ' <span class="badge ' + r.level + '">' + labels[r.level] + '</span></span>'
+      + '<span class="prob">' + fmtProb(r.probability) + '</span>';
+    div.appendChild(head);
+
+    const bar = document.createElement('div');
+    bar.className = 'bar';
+    bar.innerHTML = '<i style="width:' + (r.probability * 100).toFixed(2) + '%"></i>';
+    div.appendChild(bar);
+
+    const smi = document.createElement('div');
+    smi.className = 'smi';
+    smi.textContent = '前体：' + r.precursors;
+    div.appendChild(smi);
+
+    const draw = document.createElement('div');
+    draw.className = 'draw';
+    div.appendChild(draw);
+
+    const foot = document.createElement('div');
+    foot.className = 'foot';
+    foot.textContent = '前体分子数：' + r.num_molecules;
+    div.appendChild(foot);
+
+    box.appendChild(div);
+
+    // 绘制（容器已进入 document，绘制时再补一次也可以）
+    const wrap = document.createElement('div');
+    draw.appendChild(wrap);
+
+    if (useRxn) {
+      const okRxn = drawReactionLine(wrap, r.precursors, d.product, { productIsTarget: true });
+      if (!okRxn) {
+        wrap.innerHTML = '';
+        drawSeparate(wrap, r.precursors, d.product);
+      }
+    } else {
+      drawSeparate(wrap, r.precursors, d.product);
+    }
+  });
+}
+
+/**
+ * 分行展示：前体一行、目标产物一行，每个分子单独画。
+ * 因为不用挤在同一行，键长可以给得更大（bondPx 40）。
+ * （之前这个函数和 drawReactionLine 行为完全一样，导致 UI 上那个
+ *   「分别画出每个分子」的勾选框形同虚设，这里修正。）
+ */
+function drawSeparate(container, precursorSmiles, productSmiles) {
+  container.innerHTML = '';
+  const parts = splitParts(precursorSmiles);
+
+  const row1 = document.createElement('div');
+  row1.className = 'rxnline';
+  parts.forEach((smi, i) => {
+    row1.appendChild(molCell(
+      smi,
+      parts.length > 1 ? ('前体 ' + (i + 1)) : '前体',
+      '',
+      { bondPx: 44, minPx: 130 }
+    ));
+  });
+  container.appendChild(row1);
+
+  const sep = document.createElement('div');
+  sep.style.cssText = 'text-align:center;color:#c3cbd8;font-size:15px;margin:4px 0;line-height:1';
+  sep.textContent = '▼';
+  container.appendChild(sep);
+
+  const row2 = document.createElement('div');
+  row2.className = 'rxnline';
+  row2.appendChild(molCell(productSmiles, '目标产物', 'target', { bondPx: 44, minPx: 130 }));
+  container.appendChild(row2);
+  return true;
+}
+
+/* ================= 多步合成路径 ================= */
+$('searchBtn').onclick = async () => {
+  const smiles = currentSmiles();
+  if (!smiles) {
+    $('status2').innerHTML = '<div class="err">' + (INMODE === 'draw'
+      ? '请先粘贴 ChemDraw 结构（或 CDXML / SMILES 文本）'
+      : '请先输入目标分子的 SMILES') + '</div>';
+    return;
+  }
+
+  // 指定起始物料（白名单）：留空则只用「重原子数」规则判断
+  const matsRaw = ($('startMats').value || '').trim();
+  const mats = matsRaw ? matsRaw.split(/[\s,;、]+/).filter(Boolean) : [];
+  const requireMats = $('requireMats').checked && mats.length > 0;
+  if ($('requireMats').checked && !mats.length) {
+    $('status2').innerHTML = '<div class="err">勾选了「仅保留包含上述原料的路线」，'
+      + '但「指定起始物料」是空的。请填写原料 SMILES，或取消该勾选。</div>';
+    return;
+  }
+
+  $('searchBtn').disabled = true;
+  $('routesBox').innerHTML = '';
+  $('smBox').innerHTML = '';
+  $('status2').innerHTML = '<span class="spinner"></span>正在搜索合成路径（模型加载 + 树搜索，约 30–150 秒）...';
+  try {
+    const payload = {
+      smiles,
+      model: $('model').value,
+      max_routes: parseInt($('max_routes').value) || 3,
+      max_depth: parseInt($('max_depth').value) || 3,
+      max_calls: parseInt($('max_calls').value) || 60,
+      max_heavy_atoms: parseInt($('max_heavy_atoms').value) || 10,
+    };
+    if (mats.length) payload.purchasable = mats;
+    if (requireMats) payload.required_materials = mats;
+
+    const d = await post('/api/search', payload);
+    if (!d.ok) { renderFail($('status2'), d, '搜索'); return; }
+    renderRoutes(d);
+    let extraTxt = '';
+    if (d.purchasable && d.purchasable.length) {
+      extraTxt += ' &nbsp;|&nbsp; 起始物料白名单 ' + d.purchasable.length + ' 个';
+    }
+    if (d.filtered_out) {
+      extraTxt += ' &nbsp;|&nbsp; <span style="color:#b45309">已过滤掉 ' + d.filtered_out
+        + ' 条不含指定原料的路线</span>';
+    }
+    $('status2').innerHTML = '<span style="color:#059669;font-weight:600">✔ 搜索完成</span>'
+      + ' &nbsp;加载 ' + d.load_seconds + 's &nbsp;|&nbsp; 搜索 ' + d.search_seconds + 's'
+      + ' &nbsp;|&nbsp; 图节点：OR ' + d.stats.or_nodes + ' / AND ' + d.stats.and_nodes
+      + extraTxt;
+  } catch (e) {
+    $('status2').innerHTML = '<div class="err">请求失败：' + esc(e) + '</div>';
+  } finally {
+    $('searchBtn').disabled = false;
+  }
+};
+
+function renderRoutes(d) {
+  const box = $('routesBox');
+  box.innerHTML = '';
+
+  if (!d.routes || !d.routes.length) {
+    let tail = '';
+    if (d.filtered_out) {
+      tail = '<br><br><b style="color:#b45309">注意</b>：搜索本身找到了 ' + d.filtered_out
+        + ' 条完整路线，但都<b>没有用到</b>你指定的那些原料，已被过滤掉。'
+        + '建议把该原料也填进「指定起始物料」白名单后再搜一次——这样搜索会优先沿着它走。';
+    } else if (d.purchasable && d.purchasable.length) {
+      tail = '<br><br>已启用起始物料白名单 <b>' + d.purchasable.length
+        + ' 个分子</b>。若仍未找到路线，可再调大「起始物料上限」或「搜索预算」。';
+    }
+    box.innerHTML = '<div class="card"><div class="empty">'
+      + '未找到完整合成路径。<br><br>可尝试：把「起始物料上限（重原子数）」调大（如 12–14），'
+      + '或增大「搜索预算」与「最大步数」。' + tail + '</div></div>';
+    return;
+  }
+
+  const startSet = new Set(d.starting_materials || []);
+
+  d.routes.forEach((rt, idx) => {
+    const card = document.createElement('div');
+    card.className = 'route';
+
+    // ---- 头部 ----
+    const head = document.createElement('div');
+    head.className = 'route-head';
+    const tp = rt.total_probability;
+    const probTxt = fmtProb(tp);
+    head.innerHTML = '<span class="route-title"><span class="rt-idx">' + (idx + 1) + '</span>路径 ' + (idx + 1) + '</span>'
+      + '<span class="route-badges">'
+      + '<span class="pill">' + rt.num_steps + ' 步</span>'
+      + '<span class="pill gray">' + rt.material_count + ' 个起始物料</span>'
+      + '<span class="pill gold">整体产率估计 ' + probTxt + '</span>'
+      + '</span>';
+    card.appendChild(head);
+
+    // ---- 视图切换：路线图（默认）/ 分步详情 ----
+    const sv = document.createElement('div');
+    sv.className = 'subview';
+    sv.innerHTML = '<span class="sv active" data-view="map">路线图</span>'
+      + '<span class="sv" data-view="steps">分步详情</span>';
+    card.appendChild(sv);
+
+    // ---- 路线图容器（整条路线连在一起）----
+    const mapHost = document.createElement('div');
+    mapHost.className = 'rtmap';
+    card.appendChild(mapHost);
+
+    // ---- 分步详情容器（默认隐藏）----
+    const steps = document.createElement('div');
+    steps.className = 'steps';
+    steps.style.display = 'none';
+
+    // 从目标产物往下排：目标 → 中间体 → ... → 起始物料
+    const ordered = orderSteps(rt.steps, d.target);
+
+    ordered.forEach((s, i) => {
+      const st = document.createElement('div');
+      st.className = 'step';
+
+      const top = document.createElement('div');
+      top.className = 'step-top';
+      top.innerHTML = '<span class="step-no">' + (i + 1) + '</span>'
+        + '<span class="step-label">第 ' + (i + 1) + ' 步</span>'
+        + '<span class="step-prob">' + (s.probability != null ? fmtProb(s.probability) : '') + '</span>';
+      st.appendChild(top);
+
+      const line = document.createElement('div');
+      st.appendChild(line);
+      drawReactionLine(line, s.reactants_joined, s.product, {
+        productIsTarget: s.product === d.target,
+        startSet: startSet,
+      });
+
+      const smi = document.createElement('div');
+      smi.className = 'smi';
+      smi.style.marginTop = '8px';
+      smi.textContent = '前体：' + s.reactants_joined + '   →   ' + s.product;
+      st.appendChild(smi);
+
+      steps.appendChild(st);
+    });
+
+    card.appendChild(steps);
+
+    // ---- 切换逻辑 ----
+    sv.querySelectorAll('.sv').forEach(el => {
+      el.onclick = () => {
+        sv.querySelectorAll('.sv').forEach(x => x.classList.remove('active'));
+        el.classList.add('active');
+        const isMap = el.dataset.view === 'map';
+        mapHost.style.display = isMap ? 'block' : 'none';
+        steps.style.display  = isMap ? 'none' : 'block';
+        // 从 display:none 切回来时布局刚建立，需要重画连线
+        if (isMap) requestAnimationFrame(() => drawTreeLines(mapHost));
+      };
+    });
+
+    box.appendChild(card);
+
+    // ---- 渲染路线图（插入 DOM 后再画连线）----
+    const tree = buildRouteTree(rt.steps, d.target, startSet);
+    renderRouteMap(mapHost, tree, d.target);
+  });
+
+  // ---- 起始物料汇总 ----
+  if (startSet.size) {
+    const sm = document.createElement('div');
+    sm.className = 'card';
+    sm.innerHTML = '<div class="sm-box"><div class="sm-title">✔ 本路线所需的起始物料（可直接采购/已有试剂）</div>'
+      + '<div class="sm-list" id="smList"></div></div>';
+    $('smBox').appendChild(sm);
+    const list = sm.querySelector('#smList');
+    Array.from(startSet).forEach(s => {
+      const item = document.createElement('div');
+      item.className = 'sm-item';
+      const b = document.createElement('div');
+      item.appendChild(b);
+      const t = document.createElement('div');
+      t.className = 'sm-smi';
+      t.textContent = s;
+      item.appendChild(t);
+      drawMolecule(b, s, { bondPx: 48, minPx: 168, maxPx: 340 });
+      list.appendChild(item);
+    });
+  }
+
+  // ---- 统计 ----
+  const stat = document.createElement('div');
+  stat.className = 'card';
+  stat.innerHTML = '<div class="stats">'
+    + '搜索图规模：OR 节点 ' + d.stats.or_nodes + ' 个、AND 节点 ' + d.stats.and_nodes
+    + ' 个 &nbsp;|&nbsp; 起始物料判定阈值：重原子数 ≤ ' + d.stats.max_heavy_atoms
+    + ' &nbsp;|&nbsp; 模型：' + esc(d.model) + '</div>';
+  $('smBox').appendChild(stat);
+}
+
+/* ================= 路线图：把整条路线画成一张连通的图 =================
+   逆合成惯例：目标产物在最上层，往下逐层分解，最底层是可采购的起始物料。
+   层与层之间用 SVG 贝塞尔曲线连接，线上标注该步产率 —— 这样整条长路线
+   是一个整体，而不是一堆割裂的卡片。
+============================================================ */
+
+const MAX_TREE_NODES = 80;   // 节点上限，防止极端情况下布局爆炸
+
+/**
+ * 由 steps 构建逆合成树。
+ * 返回 { levels: [[node,...], ...], edges: [{from, to, step}] }
+ * node = { smiles, depth, step, isTarget, isStart, ancestors, index, el }
+ *   step 语义：以该分子为 product 的那一步（用它往下连子节点）
+ */
+function buildRouteTree(steps, target, startSet) {
+  const byProduct = {};
+  steps.forEach(s => { byProduct[s.product] = s; });
+
+  const levels = [];
+  const edges = [];
+  let count = 0;
+
+  // 若 target 与模型输出写法不完全一致，退回用第一步的 product 当根
+  const rootSmiles = byProduct[target] ? target
+    : (steps.length ? steps[0].product : target);
+
+  function makeNode(smiles, depth, ancestors) {
+    if (count >= MAX_TREE_NODES) return null;
+    if (ancestors.has(smiles)) return null;          // 环保护
+    count++;
+    if (!levels[depth]) levels[depth] = [];
+    const node = {
+      smiles: smiles,
+      depth: depth,
+      step: byProduct[smiles] || null,
+      isTarget: depth === 0,
+      isStart: startSet.has(smiles),
+      ancestors: new Set(ancestors).add(smiles),
+      index: levels[depth].length,
+    };
+    levels[depth].push(node);
+    return node;
+  }
+
+  const root = makeNode(rootSmiles, 0, new Set());
+  if (!root) return { levels: levels, edges: edges };
+
+  const queue = [root];
+  while (queue.length) {
+    const cur = queue.shift();
+    const s = cur.step;
+    if (!s) continue;                    // 没有以它为产物的步 → 它就是起始物料
+    if (cur.depth >= 8) continue;
+    s.reactants.forEach(r => {
+      const child = makeNode(r, cur.depth + 1, cur.ancestors);
+      if (!child) return;
+      edges.push({ from: cur, to: child, step: s });
+      if (child.step) queue.push(child);
+    });
+  }
+  return { levels: levels, edges: edges };
+}
+
+/** 渲染路线图到 host（含连线层） */
+function renderRouteMap(host, tree, target) {
+  host.innerHTML = '';
+  host._tree = tree;
+
+  if (!tree.levels.length) {
+    host.innerHTML = '<div class="empty">这条路线没有可展开的步骤。</div>';
+    return;
+  }
+
+  const inner = document.createElement('div');
+  inner.className = 'rtmap-inner';
+
+  // 一步路线卡片很少 → 把分子画大；层数多时才收敛，避免整图撑爆
+  const nodeSize = rtnodeSize(tree.levels.length);
+
+  tree.levels.forEach((nodes, depth) => {
+    if (!nodes || !nodes.length) return;
+    const layer = document.createElement('div');
+    layer.className = 'rtlayer';
+
+    const flag = document.createElement('span');
+    flag.className = 'rtlayer-flag';
+    flag.textContent = (depth === 0) ? '目标产物' : ('第 ' + depth + ' 层前体');
+    layer.appendChild(flag);
+
+    nodes.forEach(n => {
+      const el = makeRtnode(n, nodeSize);
+      n.el = el;
+      layer.appendChild(el);
+    });
+    inner.appendChild(layer);
+  });
+
+  host.appendChild(inner);
+
+  // DOM 插入后再测量画线；画两次兜底（等库的渲染完全落地）
+  requestAnimationFrame(() => drawTreeLines(host));
+  setTimeout(() => drawTreeLines(host), 160);
+}
+
+/**
+ * 路线图节点的分子尺寸：**层数越少，分子画得越大**。
+ * 一步路线只有两三张卡片，横向空间完全够用，没必要把分子压小；
+ * 层数多时才需要收敛尺寸，避免整张图撑得过大。
+ * 同一张路线图内统一用同一档，保证键长一致、各分子大小可比。
+ */
+function rtnodeSize(nLevels) {
+  if (nLevels <= 2) return { bondPx: 50, minPx: 176, maxPx: 380 };
+  if (nLevels === 3) return { bondPx: 44, minPx: 150, maxPx: 340 };
+  if (nLevels === 4) return { bondPx: 39, minPx: 130, maxPx: 300 };
+  if (nLevels === 5) return { bondPx: 35, minPx: 118, maxPx: 275 };
+  return { bondPx: 32, minPx: 105, maxPx: 245 };
+}
+
+/** 单个分子节点卡 */
+function makeRtnode(n, size) {
+  const el = document.createElement('div');
+  el.className = 'rtnode'
+    + (n.isTarget ? ' is-target' : (n.isStart ? ' is-start' : ''));
+
+  const tag = document.createElement('span');
+  tag.className = 'rt-tag';
+  tag.textContent = n.isTarget ? '目标产物' : (n.isStart ? '起始物料' : '中间体');
+  el.appendChild(tag);
+
+  const mol = document.createElement('div');
+  mol.className = 'rtnode-mol';
+  el.appendChild(mol);
+  drawMolecule(mol, n.smiles, size || rtnodeSize(3));
+
+  const smi = document.createElement('div');
+  smi.className = 'rtnode-smi';
+  smi.textContent = n.smiles;
+  smi.title = n.smiles;
+  el.appendChild(smi);
+
+  return el;
+}
+
+/** 画层间连线（贝塞尔曲线 + 产率标签） */
+function drawTreeLines(host) {
+  const tree = host && host._tree;
+  if (!tree) return;
+  const inner = host.querySelector('.rtmap-inner');
+  if (!inner) return;
+
+  const old = inner.querySelector('.rtmap-lines');
+  if (old) old.remove();
+
+  const NS = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(NS, 'svg');
+  svg.setAttribute('class', 'rtmap-lines');
+
+  const irect = inner.getBoundingClientRect();
+  const W = Math.max(1, Math.round(irect.width));
+  const H = Math.max(1, Math.round(irect.height));
+  svg.setAttribute('width', W);
+  svg.setAttribute('height', H);
+  svg.setAttribute('viewBox', '0 0 ' + W + ' ' + H);
+
+  inner.insertBefore(svg, inner.firstChild);
+
+  const baseX = irect.left, baseY = irect.top;
+  const labels = [];
+  const labeled = new Set();   // 同一个父节点只标一次产率
+
+  tree.edges.forEach(e => {
+    const a = e.from.el, b = e.to.el;
+    if (!a || !b) return;
+    const ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect();
+    if (!ra.width || !rb.width) return;
+
+    // 父节点底部中心 → 子节点顶部中心
+    const x1 = ra.left - baseX + ra.width / 2;
+    const y1 = ra.bottom - baseY;
+    const x2 = rb.left - baseX + rb.width / 2;
+    const y2 = rb.top - baseY;
+    const my = y1 + (y2 - y1) * 0.55;
+
+    const path = document.createElementNS(NS, 'path');
+    path.setAttribute('d', 'M ' + x1 + ' ' + y1
+      + ' C ' + x1 + ' ' + my + ', ' + x2 + ' ' + my + ', ' + x2 + ' ' + y2);
+    path.setAttribute('fill', 'none');
+    path.setAttribute('stroke', '#a9c4f8');
+    path.setAttribute('stroke-width', '1.6');
+    path.setAttribute('stroke-linecap', 'round');
+    svg.appendChild(path);
+
+    // 起点 / 落点小圆点，让连接关系更明确
+    const dot0 = document.createElementNS(NS, 'circle');
+    dot0.setAttribute('cx', x1); dot0.setAttribute('cy', y1);
+    dot0.setAttribute('r', '2.4'); dot0.setAttribute('fill', '#c3d7fb');
+    svg.appendChild(dot0);
+
+    const dot1 = document.createElementNS(NS, 'circle');
+    dot1.setAttribute('cx', x2); dot1.setAttribute('cy', y2);
+    dot1.setAttribute('r', '3'); dot1.setAttribute('fill', '#7fa8f4');
+    svg.appendChild(dot1);
+
+    // 产率只在该父节点的分叉处标一次（否则同一步会被重复标注 N 次）
+    const pid = e.from.depth + '|' + e.from.index;
+    const p = e.step && e.step.probability;
+    if (p != null && !labeled.has(pid)) {
+      labeled.add(pid);
+      labels.push({
+        x: x1,
+        y: y1 + 19,                 // 父节点正下方、连线分叉处
+        text: fmtProb(p),
+      });
+    }
+  });
+
+  // 标签最后画，保证盖在连线之上
+  labels.forEach(L => {
+    const w = 14 + L.text.length * 6.6;
+    const h = 17;
+    const g = document.createElementNS(NS, 'g');
+
+    const rect = document.createElementNS(NS, 'rect');
+    rect.setAttribute('x', L.x - w / 2);
+    rect.setAttribute('y', L.y - h / 2);
+    rect.setAttribute('width', w);
+    rect.setAttribute('height', h);
+    rect.setAttribute('rx', '8.5');
+    rect.setAttribute('fill', '#ffffff');
+    rect.setAttribute('stroke', '#dbe8fd');
+    rect.setAttribute('stroke-width', '1');
+    g.appendChild(rect);
+
+    const t = document.createElementNS(NS, 'text');
+    t.setAttribute('x', L.x);
+    t.setAttribute('y', L.y + 3.7);
+    t.setAttribute('text-anchor', 'middle');
+    t.setAttribute('font-size', '10.5');
+    t.setAttribute('font-weight', '600');
+    t.setAttribute('fill', '#2563eb');
+    t.setAttribute('font-family', 'Consolas, monospace');
+    t.textContent = L.text;
+    g.appendChild(t);
+    svg.appendChild(g);
+  });
+}
+
+/**
+ * 把后端返回的 steps 按「从目标产物向下的合成顺序」重排。
+ * 后端 steps 里每步含 {product, reactants,...}。
+ * 我们以 target 为起点，找 product==current 的步，再把该步的 reactants
+ * 中「出现在其它步 product 里」的分子作为下一层继续，直到起始物料。
+ */
+function orderSteps(steps, target) {
+  const byProduct = {};
+  steps.forEach(s => { byProduct[s.product] = s; });
+
+  const ordered = [];
+  const visited = new Set();
+  const queue = [target];
+
+  while (queue.length) {
+    const cur = queue.shift();
+    const s = byProduct[cur];
+    if (!s || visited.has(cur)) continue;
+    visited.add(cur);
+    ordered.push(s);
+    // 该步的前体中，若也是某步的产物，就是中间体，下一层继续展开
+    s.reactants.forEach(r => {
+      if (byProduct[r] && !visited.has(r)) queue.push(r);
+    });
+  }
+
+  // 兜底：若有步没被覆盖（图不连通/多目标），按原顺序补上
+  if (ordered.length < steps.length) {
+    steps.forEach(s => { if (!visited.has(s.product)) ordered.push(s); });
+  }
+  return ordered;
+}
+
+/* ================= 工具 ================= */
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+  ));
+}
+
+/**
+ * 统一产率格式化：按量级自动选精度。
+ * 模型给出的产率可能低到 0.03%，用固定 1 位小数会全部变成 "0.0%"。
+ */
+function fmtProb(p) {
+  if (p === null || p === undefined || isNaN(p)) return '—';
+  const pct = p * 100;
+  if (pct >= 10)   return pct.toFixed(1) + '%';
+  if (pct >= 1)    return pct.toFixed(2) + '%';
+  if (pct >= 0.01) return pct.toFixed(3) + '%';
+  if (pct > 0)     return pct.toFixed(4) + '%';
+  return '0%';
+}
+
+/* 右下角轻提示 */
+function toast(msg, type) {
+  let box = document.getElementById('toastBox');
+  if (!box) {
+    box = document.createElement('div');
+    box.id = 'toastBox';
+    box.style.cssText = 'position:fixed;right:22px;bottom:22px;z-index:9999;display:flex;flex-direction:column;gap:9px;max-width:420px';
+    document.body.appendChild(box);
+  }
+  const colors = {
+    ok:    ['#ecfdf5', '#a7f3d0', '#065f46'],
+    info:  ['#eff6ff', '#bfdbfe', '#1e40af'],
+    error: ['#fef2f2', '#fecaca', '#b91c1c'],
+  }[type] || ['#f9fafb', '#e5e7eb', '#374151'];
+
+  const d = document.createElement('div');
+  d.style.cssText = 'background:' + colors[0] + ';border:1px solid ' + colors[1] + ';color:' + colors[2] +
+    ';padding:11px 15px;border-radius:8px;font-size:13px;line-height:1.6;box-shadow:0 4px 14px rgba(0,0,0,.1);' +
+    'opacity:0;transform:translateY(8px);transition:opacity .2s,transform .2s;word-break:break-word';
+  d.textContent = msg;
+  box.appendChild(d);
+  requestAnimationFrame(() => { d.style.opacity = '1'; d.style.transform = 'none'; });
+  setTimeout(() => {
+    d.style.opacity = '0'; d.style.transform = 'translateY(8px)';
+    setTimeout(() => d.remove(), 220);
+  }, type === 'error' ? 7000 : 3600);
+}
+</script>
+</body>
+</html>
