@@ -163,6 +163,7 @@ except Exception as _e:  # noqa: BLE001
     print(f"[app] 注意：任务中心未启用（{_e}），/api/predict 仍可用但无进度", flush=True)
 
 _PREDICT_RUNNER = None
+_SEARCH_RUNNER = None
 
 # --- 大模型工艺分析（投料顺序 / 当量 / 条件 / 副产物 / LCMS / NMR） -------------
 # 走独立的 OpenAI 兼容客户端，与模型推理链路完全解耦：不占主线程 pump、不 spawn 子进程。
@@ -176,14 +177,20 @@ except Exception as _e:  # noqa: BLE001
 
 
 def _setup_jobhub():
-    """装配预测 runner（幂等）。"""
-    global _PREDICT_RUNNER
+    """装配预测 + 搜索 runner（幂等）。"""
+    global _PREDICT_RUNNER, _SEARCH_RUNNER
     if jobhub is None:
         return None
     if _PREDICT_RUNNER is None:
         _PREDICT_RUNNER = jobhub.make_predict_runner(
             validate_target_smiles=validate_target_smiles,
             predict_fn=predict_remote,
+            model_keys=set(MODELS.keys()),
+        )
+    if _SEARCH_RUNNER is None:
+        _SEARCH_RUNNER = jobhub.make_search_runner(
+            validate_target_smiles=validate_target_smiles,
+            search_fn=search_remote,
             model_keys=set(MODELS.keys()),
         )
     return _PREDICT_RUNNER
@@ -253,6 +260,24 @@ def model_worker_main(req_q, resp_q, model_key: str) -> None:
         if req is None:
             break
         try:
+            if req.get("kind") == "search":
+                # 🔴 搜索也在 worker 里跑：复用这里已经加载的 model，不在 Flask 进程
+                #    再载一份（否则内存翻倍）。run_retro_search 是纯函数，只依赖传入
+                #    的 model 对象，与同步 /api/search 共用同一份逻辑。
+                result = run_retro_search(
+                    model,
+                    smiles=req["smiles"],
+                    max_routes=req.get("max_routes", 5),
+                    max_calls=req.get("max_calls", 60),
+                    time_limit=req.get("time_limit", 120.0),
+                    max_depth=req.get("max_depth", 3),
+                    max_heavy_atoms=req.get("max_heavy_atoms", 10),
+                    value_fn=req.get("value_fn", "complexity"),
+                    purchasable=req.get("purchasable") or [],
+                    required_materials=req.get("required_materials") or [],
+                )
+                resp_q.put({"type": "result", "id": req["id"], "ok": True, "search": result})
+                continue
             preds = model([Molecule(req["smiles"])], num_results=req["num_results"])
             # 🔴 str(p) 是**反应 SMILES**（reactants>>product），不是纯前体；
             #    反应物侧的拆解在 jobhub 的 runner 里做（reaction -> precursor_list）。
@@ -302,6 +327,37 @@ def predict_remote(smiles: str, model_key: str, num_results: int) -> list:
             if not resp.get("ok"):
                 raise RuntimeError(resp.get("error", "模型推理失败"))
             return resp["results"]
+
+
+def search_remote(params: dict) -> dict:
+    """搜索桥：把 search 请求丢进队列，阻塞等 worker 进程的 Retro* 结果回来。
+
+    返回 worker 给的已序列化搜索结果 dict（routes / starting_materials / stats）。
+    本函数运行在 Flask 主线程的 job pump 里，只做 IPC，绝不 spawn 子进程。
+    与 predict_remote 唯一区别：请求带 `kind: "search"`、结果读 `search` 字段。
+    """
+    global _WORKER_FAILED
+    if _WORKER_FAILED or _REQ_Q is None or _RESP_Q is None:
+        raise RuntimeError("模型 worker 进程未就绪（可能启动失败或已崩溃）")
+    import uuid
+
+    rid = uuid.uuid4().hex
+    _REQ_Q.put({"id": rid, "kind": "search", **params})
+    while True:
+        try:
+            resp = _RESP_Q.get(timeout=float(os.environ.get("RETRO_WORKER_TIMEOUT", "1800")))
+        except Exception:  # noqa: BLE001
+            raise RuntimeError("模型 worker 进程无响应（可能已崩溃）")
+        if resp.get("type") == "ready":
+            if resp.get("error"):
+                _WORKER_FAILED = True
+                raise RuntimeError("模型 worker 启动失败：" + resp["error"])
+            _WORKER_READY.set()
+            continue
+        if resp.get("id") == rid:
+            if not resp.get("ok"):
+                raise RuntimeError(resp.get("error", "搜索失败"))
+            return resp.get("search", {})
 
 
 # --------------------------------------------------------------------------
@@ -1295,9 +1351,16 @@ def validate_target_smiles(smiles: str):
 
 @app.route("/api/jobs", methods=["POST"])
 def api_jobs_create():
-    """创建一个后台预测任务，立即返回 job_id（不阻塞）。
+    """创建一个后台任务，立即返回 job_id（不阻塞）。
 
-    请求体：{"smiles": "...", "model": "pistachio", "num_results": 5}
+    kind=predict（默认，单步逆合成）：
+      请求体：{"smiles": "...", "model": "pistachio", "num_results": 5}
+    kind=search（多步路线搜索，一次搜到底）：
+      请求体：{"smiles": "...", "model": "pistachio", "max_routes": 5,
+               "max_calls": 60, "time_limit": 120, "max_depth": 3,
+               "max_heavy_atoms": 10, "value_fn": "complexity",
+               "purchasable": [], "required_materials": []}
+
     响应：  {"ok": true, "job_id": "..."}
     """
     if jobhub is None or _setup_jobhub() is None:
@@ -1305,12 +1368,29 @@ def api_jobs_create():
     data = request.get_json(force=True, silent=True) or {}
     if not str(data.get("smiles") or "").strip():
         return jsonify({"ok": False, "error": "请输入目标分子的结构或 SMILES"}), 400
-    params = {
-        "smiles": str(data.get("smiles")).strip(),
-        "model": data.get("model", "pistachio"),
-        "num_results": int(data.get("num_results", 5)),
-    }
-    job = jobhub.submit("predict", params, _PREDICT_RUNNER)
+
+    kind = str(data.get("kind") or "predict").strip().lower()
+    if kind == "search":
+        params = {
+            "smiles": str(data.get("smiles")).strip(),
+            "model": data.get("model", "pistachio"),
+            "max_routes": int(data.get("max_routes", 5)),
+            "max_calls": int(data.get("max_calls", 60)),
+            "time_limit": float(data.get("time_limit", 120)),
+            "max_depth": int(data.get("max_depth", 3)),
+            "max_heavy_atoms": int(data.get("max_heavy_atoms", 10)),
+            "value_fn": str(data.get("value_fn") or "complexity"),
+            "purchasable": data.get("purchasable") or [],
+            "required_materials": data.get("required_materials") or [],
+        }
+        job = jobhub.submit("search", params, _SEARCH_RUNNER)
+    else:
+        params = {
+            "smiles": str(data.get("smiles")).strip(),
+            "model": data.get("model", "pistachio"),
+            "num_results": int(data.get("num_results", 5)),
+        }
+        job = jobhub.submit("predict", params, _PREDICT_RUNNER)
     return jsonify({"ok": True, "job_id": job.id})
 
 
@@ -1440,6 +1520,140 @@ def api_predict():
         return jsonify({"ok": False, "error": f"{type(e).__name__}: {e}"}), 500
 
 
+def run_retro_search(model, *, smiles, max_routes=5, max_calls=60, time_limit=120.0,
+                     max_depth=3, max_heavy_atoms=10, value_fn="complexity",
+                     purchasable=None, required_materials=None):
+    """跑一次 Retro* 搜索并提取路线（**纯函数，只依赖传入的 model 对象**）。
+
+    🔴 为什么把这段从 /api/search 抽出来、且接受「model 对象」而不是 model_key：
+        搜索任务要在**独立 worker 进程**里跑（复用那里已加载的模型，不在 Flask 进程
+        再载一份），而 worker 里已经有 model 实例。同步 /api/search 则传 `get_model(key)`。
+        两者共用这一份逻辑，避免「同步接口和异步任务各写一遍、结果不一致」。
+
+    返回 dict（不含 jsonify 包装）：{ok, target, model, routes, starting_materials,
+    purchasable, required_materials, filtered_out, value_fn, stats, load_seconds,
+    search_seconds}。异常由调用方决定如何呈现。
+    """
+    from syntheseus import Molecule
+    from syntheseus.search.algorithms.best_first.retro_star import RetroStarSearch
+    from syntheseus.search.analysis.route_extraction import iter_routes_time_order
+    from syntheseus.search.graph.and_or import AndNode, OrNode
+    from syntheseus.search.node_evaluation.common import ReactionModelLogProbCost
+
+    # 参数保护（与 /api/search 同一套边界，别让 worker 端收到越界值）
+    max_routes = max(1, min(int(max_routes), 20))
+    max_calls = max(5, min(int(max_calls), 400))
+    time_limit = max(10.0, min(float(time_limit), 600.0))
+    max_depth = max(1, min(int(max_depth), 8))
+    max_heavy_atoms = max(1, min(int(max_heavy_atoms), 40))
+    if value_fn not in ("constant", "complexity"):
+        value_fn = "complexity"
+
+    inventory = make_inventory(max_heavy_atoms, purchasable)
+
+    t1 = time.time()
+    searcher = RetroStarSearch(
+        reaction_model=model,
+        mol_inventory=inventory,
+        value_function=make_value_function(value_fn, inventory, max_heavy_atoms),
+        and_node_cost_fn=ReactionModelLogProbCost(),
+        limit_reaction_model_calls=max_calls,
+        time_limit_s=time_limit,
+        max_expansion_depth=max_depth,
+    )
+    graph, _ = searcher.run_from_mol(Molecule(smiles))
+    search_s = time.time() - t1
+
+    # ---- 提取路径 ----
+    or_nodes = [n for n in graph.nodes() if isinstance(n, OrNode)]
+    and_nodes = [n for n in graph.nodes() if isinstance(n, AndNode)]
+
+    routes = []
+    for nodes in iter_routes_time_order(graph, max_routes=max_routes):
+        steps = []
+        for n in nodes:
+            if not isinstance(n, AndNode):
+                continue
+            rxn = n.reaction
+            try:
+                prob = rxn.metadata.get("probability")
+            except Exception:  # noqa: BLE001
+                prob = None
+            reactants = sorted(m.smiles for m in rxn.reactants)
+            steps.append(
+                {
+                    "product": rxn.product.smiles,
+                    "reactants": reactants,
+                    "reactants_joined": ".".join(reactants),
+                    "probability": float(prob) if prob is not None else None,
+                }
+            )
+        if steps:
+            probs = [s["probability"] for s in steps if s["probability"] is not None]
+            total = 1.0
+            for p in probs:
+                total *= p
+            routes.append(
+                {
+                    "steps": steps,
+                    "num_steps": len(steps),
+                    "total_probability": total if probs else None,
+                    "material_count": sum(
+                        1
+                        for s in steps
+                        for r in s["reactants"]
+                        if not any(r == t["product"] for t in steps)
+                    ),
+                }
+            )
+
+    # ---- 「路线必须包含指定原料」过滤 ----
+    filtered_out = 0
+    if required_materials:
+        required_set = set(required_materials)
+        kept = []
+        for rt in routes:
+            present = set()
+            for step in rt["steps"]:
+                present.add(step["product"])
+                present.update(step["reactants"])
+            present_canon = {c for c in (canon_smiles(x) for x in present) if c}
+            if required_set.issubset(present_canon):
+                kept.append(rt)
+        filtered_out = len(routes) - len(kept)
+        routes = kept
+
+    # 按总概率降序
+    routes.sort(key=lambda r: (r["total_probability"] is None, -(r["total_probability"] or 0)))
+
+    # 路线里出现的所有分子（用于标注起始物料）
+    all_products = {s["product"] for r in routes for s in r["steps"]}
+    starting_materials = set()
+    for r in routes:
+        for s in r["steps"]:
+            for react in s["reactants"]:
+                if react not in all_products:
+                    starting_materials.add(react)
+
+    return {
+        "ok": True,
+        "target": smiles,
+        "routes": routes,
+        "starting_materials": sorted(starting_materials),
+        "purchasable": sorted(purchasable or []),
+        "required_materials": sorted(required_materials or []),
+        "filtered_out": filtered_out,
+        "value_fn": value_fn,
+        "stats": {
+            "or_nodes": len(or_nodes),
+            "and_nodes": len(and_nodes),
+            "expansions": len(and_nodes),
+            "max_heavy_atoms": max_heavy_atoms,
+        },
+        "search_seconds": round(search_s, 1),
+    }
+
+
 @app.route("/api/search", methods=["POST"])
 def api_search():
     """多步合成路径搜索：返回到达起始物料的完整合成路线。"""
@@ -1505,127 +1719,26 @@ def api_search():
         return jsonify(err), 400
 
     try:
-        from syntheseus import Molecule
-        from syntheseus.search.algorithms.best_first.retro_star import RetroStarSearch
-        from syntheseus.search.analysis.route_extraction import iter_routes_time_order
-        from syntheseus.search.graph.and_or import AndNode, OrNode
-        from syntheseus.search.node_evaluation.common import ReactionModelLogProbCost
-
         t0 = time.time()
         model = get_model(model_key)
         load_s = time.time() - t0
 
-        inventory = make_inventory(max_heavy_atoms, purchasable)
-
-        t1 = time.time()
-        searcher = RetroStarSearch(
-            reaction_model=model,
-            mol_inventory=inventory,
-            value_function=make_value_function(value_fn, inventory, max_heavy_atoms),
-            and_node_cost_fn=ReactionModelLogProbCost(),
-            limit_reaction_model_calls=max_calls,
-            time_limit_s=time_limit,
-            max_expansion_depth=max_depth,
+        result = run_retro_search(
+            model,
+            smiles=smiles,
+            max_routes=max_routes,
+            max_calls=max_calls,
+            time_limit=time_limit,
+            max_depth=max_depth,
+            max_heavy_atoms=max_heavy_atoms,
+            value_fn=value_fn,
+            purchasable=purchasable,
+            required_materials=required,
         )
-        graph, _ = searcher.run_from_mol(Molecule(smiles))
-        search_s = time.time() - t1
-
-        # ---- 提取路径 ----
-        or_nodes = [n for n in graph.nodes() if isinstance(n, OrNode)]
-        and_nodes = [n for n in graph.nodes() if isinstance(n, AndNode)]
-
-        routes = []
-        for nodes in iter_routes_time_order(graph, max_routes=max_routes):
-            steps = []
-            for n in nodes:
-                if not isinstance(n, AndNode):
-                    continue
-                rxn = n.reaction
-                try:
-                    prob = rxn.metadata.get("probability")
-                except Exception:  # noqa: BLE001
-                    prob = None
-                reactants = sorted(m.smiles for m in rxn.reactants)
-                steps.append(
-                    {
-                        "product": rxn.product.smiles,
-                        "reactants": reactants,
-                        "reactants_joined": ".".join(reactants),
-                        "probability": float(prob) if prob is not None else None,
-                    }
-                )
-            if steps:
-                probs = [s["probability"] for s in steps if s["probability"] is not None]
-                # 路线总概率 = 各步概率之积（近似独立假设）
-                total = 1.0
-                for p in probs:
-                    total *= p
-                routes.append(
-                    {
-                        "steps": steps,
-                        "num_steps": len(steps),
-                        "total_probability": total if probs else None,
-                        "material_count": sum(
-                            1
-                            for s in steps
-                            for r in s["reactants"]
-                            if not any(r == t["product"] for t in steps)
-                        ),
-                    }
-                )
-
-        # ---- 「路线必须包含指定原料」过滤 ----
-        # 说明：这是搜索**完成后**的筛选，它无法改变搜索本身探索了哪些分支。
-        # 如果搜索过程中根本没走到含该原料的分支，这里会把所有路线都过滤掉，
-        # 此时应当配合「指定起始物料」白名单一起用。
-        filtered_out = 0
-        if required:
-            required_set = set(required)
-            kept = []
-            for rt in routes:
-                present = set()
-                for step in rt["steps"]:
-                    present.add(step["product"])
-                    present.update(step["reactants"])
-                present_canon = {c for c in (canon_smiles(x) for x in present) if c}
-                if required_set.issubset(present_canon):
-                    kept.append(rt)
-            filtered_out = len(routes) - len(kept)
-            routes = kept
-
-        # 按总概率降序
-        routes.sort(key=lambda r: (r["total_probability"] is None, -(r["total_probability"] or 0)))
-
-        # 路线里出现的所有分子（用于标注起始物料）
-        all_products = {s["product"] for r in routes for s in r["steps"]}
-        starting_materials = set()
-        for r in routes:
-            for s in r["steps"]:
-                for react in s["reactants"]:
-                    if react not in all_products:
-                        starting_materials.add(react)
-
-        return jsonify(
-            {
-                "ok": True,
-                "target": smiles,
-                "model": model_key,
-                "routes": routes,
-                "starting_materials": sorted(starting_materials),
-                "purchasable": sorted(purchasable),
-                "required_materials": sorted(required),
-                "filtered_out": filtered_out,
-                "value_fn": value_fn,
-                "stats": {
-                    "or_nodes": len(or_nodes),
-                    "and_nodes": len(and_nodes),
-                    "expansions": len(and_nodes),
-                    "max_heavy_atoms": max_heavy_atoms,
-                },
-                "load_seconds": round(load_s, 1),
-                "search_seconds": round(search_s, 1),
-            }
-        )
+        # 同步接口补上 model / load_seconds（异步 job 的 result 由 runner 统一补元信息）
+        result["model"] = model_key
+        result["load_seconds"] = round(load_s, 1)
+        return jsonify(result)
     except Exception as e:  # noqa: BLE001
         traceback.print_exc()
         return jsonify({"ok": False, "error": f"{type(e).__name__}: {e}"}), 500

@@ -571,6 +571,82 @@ def make_predict_runner(
     return runner
 
 
+def make_search_runner(
+    *,
+    validate_target_smiles: Callable[[str], tuple],
+    search_fn: Callable[[dict], dict],
+    model_keys: set,
+) -> Callable[[Job], dict]:
+    """构造 /api/jobs(kind=search) 的执行体。与 predict 的 runner 对称。
+
+    🔴 `search_fn(params)` 是「搜索桥」：真正的 RetroStar 搜索在**独立 worker 进程**
+        里执行（复用那里已经加载的模型，不在 Flask 进程里再载一份 —— 否则内存翻倍，
+        冷启动那 126s 就是第二份模型在加载）。worker 返回的是已序列化的路线列表 +
+        起始物料 + 统计。本进程（Flask/主线程 pump）只做 IPC，绝不 spawn 子进程。
+
+    参数契约与同步 /api/search 一致（见 app.py api_search）：
+      params = {smiles, model, max_routes, max_calls, time_limit, max_depth,
+                max_heavy_atoms, value_fn, purchasable, required_materials}
+    """
+
+    def runner(job: Job) -> dict:
+        smiles = str(job.params.get("smiles") or "").strip()
+        model_key = job.params.get("model", "pistachio")
+
+        # 1) 校验
+        job.begin_stage("validate", "校验分子结构", smiles[:60])
+        if not smiles:
+            raise ValueError("请输入目标分子的结构或 SMILES")
+        if model_key not in model_keys:
+            raise ValueError(f"未知模型: {model_key}")
+        ok_smi, smiles, err = validate_target_smiles(smiles)
+        job.check_cancel()
+        if not ok_smi:
+            job.error_payload = err or {"ok": False, "error": "分子不合法"}
+            job.error = (err or {}).get("error", "分子不合法")
+            job.error_reasons = list((err or {}).get("reasons") or [])
+            raise ValueError(job.error)
+        job.end_stage(detail=smiles)
+        job.log(f"目标分子已规范化：{smiles}", level="info")
+
+        # 2) 模型在独立 worker 进程里已加载（启动时预加载），这里跳过 load 阶段
+        job.skip_stage("load", "加载模型", "独立进程已预加载，跳过")
+
+        # 3) 搜索（经队列交给 worker 进程；worker 里跑 RetroStar，预算在此真吃满）
+        #    search 是唯一的重活，给它 0.92 的权重（validate/post 各占一点）；
+        #    load 被 skip 掉不计入分母，所以 search 要拿掉进度条的大头。
+        job.begin_stage("search", "多步路线搜索", "Retro* 广度优先 · 吃满调用预算", weight=0.92)
+        t1 = time.time()
+        result = search_fn(
+            {
+                "smiles": smiles,
+                "model": model_key,
+                "max_routes": int(job.params.get("max_routes", 5)),
+                "max_calls": int(job.params.get("max_calls", 60)),
+                "time_limit": float(job.params.get("time_limit", 120)),
+                "max_depth": int(job.params.get("max_depth", 3)),
+                "max_heavy_atoms": int(job.params.get("max_heavy_atoms", 10)),
+                "value_fn": str(job.params.get("value_fn") or "complexity"),
+                "purchasable": job.params.get("purchasable") or [],
+                "required_materials": job.params.get("required_materials") or [],
+            }
+        )
+        search_s = time.time() - t1
+        job.check_cancel()
+        n_routes = len(result.get("routes") or [])
+        job.end_stage(detail=f"{n_routes} 条路线，用时 {search_s:.1f}s")
+
+        # 4) 后处理：worker 已返回纯数据，这里只补一层「本次搜索的元信息」
+        job.begin_stage("post", "整理路线与起始物料", "")
+        result.setdefault("ok", True)
+        result["search_seconds"] = round(search_s, 1)
+        job.end_stage(detail=f"{n_routes} 条路线")
+
+        return result
+
+    return runner
+
+
 _LOADED_REF: dict = {}
 
 
