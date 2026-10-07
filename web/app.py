@@ -584,10 +584,11 @@ _API_INDEX = {
         {"method": "GET", "path": "/api/jobs/<job_id>", "desc": "查任务状态 / 取结果"},
         {"method": "POST", "path": "/api/jobs/<job_id>/cancel", "desc": "取消任务"},
         {"method": "GET", "path": "/api/llm/status", "desc": "大模型配置状态（?probe=1 真实验证）"},
-        {"method": "GET", "path": "/api/llm/models", "desc": "该 key 下可见的模型"},
-        {"method": "GET", "path": "/api/llm/settings", "desc": "大模型设置（key 脱敏）"},
-        {"method": "POST", "path": "/api/llm/settings", "desc": "保存大模型设置（含多 key 池，立即生效）"},
-        {"method": "POST", "path": "/api/llm/keys/reset", "desc": "重试失效 Key（清空失效/冷却标记）"},
+        {"method": "GET", "path": "/api/llm/models", "desc": "端点配置下可见的模型（可指定配置 / 草稿）"},
+        {"method": "GET", "path": "/api/llm/settings", "desc": "端点配置列表 + 当前配置（key 脱敏）"},
+        {"method": "POST", "path": "/api/llm/settings", "desc": "保存端点配置（多套绑定，立即生效）"},
+        {"method": "POST", "path": "/api/llm/settings/active", "desc": "切换当前使用的端点配置（无需保存）"},
+        {"method": "POST", "path": "/api/llm/keys/reset", "desc": "重试失效 Key（可按配置清）"},
         {"method": "POST", "path": "/api/llm/analyze", "desc": "工艺分析（一次性返回）"},
         {"method": "POST", "path": "/api/llm/analyze/stream", "desc": "工艺分析（SSE 流式）"},
         {"method": "POST", "path": "/api/llm/conditions/stream", "desc": "候选反应条件枚举（SSE；先选条件再深入分析）"},
@@ -1048,13 +1049,38 @@ def api_llm_status():
     return jsonify(st)
 
 
-@app.route("/api/llm/models")
+@app.route("/api/llm/models", methods=["GET", "POST"])
 def api_llm_models():
-    """列出该 key 在 /v1/models 里能看到的模型 id（仅列出，不代表套餐内可用）。"""
+    """列出这套端点配置的 key 在 /v1/models 里能看到的模型 id（仅列出，不代表套餐内可用）。
+
+    默认用当前激活的配置；也可以指定：
+      · `{profile_id: "<已保存的 id>"}` —— 拉那一套的；
+      · `{profile: {id?, base_url, api_keys}}` —— **还没保存的草稿**：新建端点时要能先看看
+        「这个地址 + 这个 key」下有哪些模型可选，否则只能盲填模型名。
+    两者的 api_keys 元素含 `*` = 按脱敏串还原成真实 key（只在该配置自己的池里匹配）。
+    """
     if llm is None:
         return jsonify({"ok": False, "error": "后端未启用大模型模块", "models": []})
-    out = llm.list_models()
-    out["current"] = llm.config().get("model")
+    sel: dict = {}
+    if request.method == "POST":
+        data = request.get_json(force=True, silent=True) or {}
+        draft = data.get("profile") if isinstance(data.get("profile"), dict) else None
+        if draft:
+            sel = dict(draft)
+        pid = str(data.get("profile_id") or "").strip()
+        if pid:
+            sel["id"] = pid
+    else:
+        pid = (request.args.get("profile_id") or "").strip()
+        if pid:
+            sel = {"id": pid}
+
+    out = llm.list_models(sel or None)
+    cur = str(sel.get("model") or "")
+    if not cur and sel.get("id"):
+        saved = next((p for p in llm.current_profiles()["profiles"] if p["id"] == sel["id"]), None)
+        cur = str((saved or {}).get("model") or "")
+    out["current"] = cur or llm.config().get("model")
     return jsonify(out)
 
 
@@ -1068,10 +1094,11 @@ def api_llm_settings():
 
 @app.route("/api/llm/settings", methods=["POST"])
 def api_llm_settings_save():
-    """保存设置面板 → web/llm_settings.json（优先级高于 .env，立即生效），复位 key 轮换。
+    """保存端点配置 → web/llm_settings.json（优先级高于 .env，立即生效），复位 key 轮换。
 
-    api_keys 元素含 `*` = 按脱敏串保留原 key；明文 = 新增。返回保存后的设置 + 最新状态，
-    前端可以一次拿全、不用再打 /llm/status。
+    提交 `{profiles: [...], active_profile: "<id>"}` 整包 —— 新建 / 修改 / 删除都走它。
+    每套里的 `api_keys` 元素含 `*` = 按脱敏串保留**该套**原 key；明文 = 新增。
+    返回保存后的设置 + 最新状态，前端一次拿全、不用再打 /llm/status。
     """
     if llm is None:
         return jsonify({"ok": False, "error": "后端未启用大模型模块"})
@@ -1081,12 +1108,32 @@ def api_llm_settings_save():
     return jsonify(out)
 
 
-@app.route("/api/llm/keys/reset", methods=["POST"])
-def api_llm_keys_reset():
-    """清空 key 的失效/冷却标记（「重试失效 Key」按钮）：全部 key 立即重新可用。"""
+@app.route("/api/llm/settings/active", methods=["POST"])
+def api_llm_settings_active():
+    """切换当前使用的端点配置（只改 active_profile，立即生效，不用点保存）。
+
+    接口地址 / 模型 / Key 是**一套绑定**的：换供应商 = 换这一套。挨个字段手动改，
+    漏一处就得到「看着配好了、一调就 401/404」的状态。
+    """
     if llm is None:
         return jsonify({"ok": False, "error": "后端未启用大模型模块"})
-    llm.reset_key_state()
+    data = request.get_json(force=True, silent=True) or {}
+    pid = str(data.get("id") or data.get("profile_id") or "").strip()
+    out = llm.activate_profile(pid)
+    out["status"] = llm.public_status()
+    return jsonify(out)
+
+
+@app.route("/api/llm/keys/reset", methods=["POST"])
+def api_llm_keys_reset():
+    """清空 key 的失效/冷却标记（「重试失效 Key」按钮）。
+
+    带 `{profile_id}` 只清那一套（按钮作用于面板上当前编辑的配置）；不带 = 全清。
+    """
+    if llm is None:
+        return jsonify({"ok": False, "error": "后端未启用大模型模块"})
+    data = request.get_json(force=True, silent=True) or {}
+    llm.reset_key_state(str(data.get("profile_id") or "").strip())
     return jsonify(llm.get_settings())
 
 

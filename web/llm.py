@@ -135,6 +135,206 @@ def _write_settings_file(data: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 「端点配置」（profile）——接口地址 + 模型 + 一组 Key 绑成一套，可存多套手动切换
+# ---------------------------------------------------------------------------
+# 🔴 为什么必须绑成一套：base_url / model / key 三者是**互相依赖**的 —— MiMo 的 key
+#    配上 DeepSeek 的地址、或 DeepSeek 的地址配 MiMo 的模型名，都是无效组合。
+#    之前它们各自是顶层散字段，换一家供应商要挨个改三处，改漏一处就得到一个
+#    「看着配好了、一调就 401/404」的状态。现在每次切换只动一个 id。
+#
+# 存储形态（llm_settings.json）：
+#     {"active_profile": "<id>", "profiles": [ {id, name, base_url, model, api_keys, ...} ]}
+# 老版本的扁平结构（base_url / model / api_keys 直接放顶层）在**读的时候**懒迁移成
+# 一套名为「默认配置」的 profile，用户升级后配置照常可用，不必手工改文件。
+def _chat_url(base: str) -> str:
+    """把接口地址补成完整的 chat/completions（允许只填到 /v1，也允许填全）。"""
+    base = str(base or "").strip().rstrip("/")
+    if base and not base.endswith("/chat/completions"):
+        base = base + "/chat/completions"
+    return base
+
+
+def _slug(raw: str, fallback: str = "profile") -> str:
+    """id 只留小写字母数字与 -_（它会进 url / 落盘，别让奇怪字符进来）。"""
+    s = re.sub(r"[^a-z0-9_-]+", "-", str(raw or "").strip().lower()).strip("-")
+    return s[:40].strip("-") or fallback
+
+
+def _host_of(url: str) -> str:
+    m = re.match(r"^[a-z][a-z0-9+.-]*://([^/?#]+)", str(url or "").strip(), re.I)
+    return m.group(1).split("@")[-1].split(":")[0].lower() if m else ""
+
+
+# 主机名里没有信息量的段（用来给新配置猜一个可读名字）
+_HOST_NOISE = ("www", "api", "openai", "com", "cn", "net", "org", "io", "ai", "co")
+
+
+def _guess_name(url: str) -> str:
+    """从接口地址猜一个可读名字：`https://api.deepseek.com/v1` → `Deepseek`。"""
+    host = _host_of(url)
+    if not host:
+        return ""
+    parts = [p for p in host.split(".") if p and p not in _HOST_NOISE]
+    seg = parts[0] if parts else host.split(".")[0]
+    return seg[:1].upper() + seg[1:]
+
+
+def _int_in(raw, default: int, lo: int, hi: int) -> int:
+    try:
+        return min(hi, max(lo, int(raw)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _float_in(raw, default: float, lo: float, hi: float) -> float:
+    try:
+        return min(hi, max(lo, float(raw)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _bool_of(raw, default: bool) -> bool:
+    if raw is None or raw == "":
+        return default
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() not in ("0", "false", "no", "off")
+
+
+def _norm_profile(raw: object, used: set) -> Optional[dict]:
+    """把一条配置归一化（字段类型兜底 + id 去重 + 名称兜底）。
+
+    返回 None = 空壳（三要素都没填），不进列表 —— 否则 UI 上会攒下一排没用的空项。
+    """
+    if not isinstance(raw, dict):
+        return None
+    base_url = str(raw.get("base_url") or "").strip()
+    model = str(raw.get("model") or "").strip()
+    keys = [str(k).strip() for k in (raw.get("api_keys") or []) if str(k).strip()]
+    name = str(raw.get("name") or "").strip()
+    if not (base_url or model or keys or name):
+        return None
+    base = _slug(raw.get("id") or name or _host_of(base_url), "profile")
+    pid = base
+    i = 2
+    while pid in used:  # 重名不冲突，但 id 必须唯一（active_profile 靠它指认）
+        pid = f"{base}-{i}"
+        i += 1
+    used.add(pid)
+    return {
+        "id": pid,
+        "name": name or _guess_name(base_url) or pid,
+        "base_url": base_url,
+        "model": model,
+        "api_keys": keys,
+        "max_tokens": _int_in(raw.get("max_tokens"), 32768, 16, 1_000_000),
+        "temperature": _float_in(raw.get("temperature"), 0.3, 0.0, 2.0),
+        "timeout": _int_in(raw.get("timeout"), 300, 5, 3600),
+        "json_mode": _bool_of(raw.get("json_mode"), True),
+        "note": str(raw.get("note") or "").strip()[:200],
+    }
+
+
+def _env_or(ov: dict, name: str):
+    """取配置项：老的顶层扁平字段 → 环境变量（.env）。"""
+    v = ov.get(name)
+    if v is None or v == "":
+        v = os.environ.get(f"RETRO_LLM_{name.upper()}")
+    return v
+
+
+def _norm_profiles(ov: dict) -> dict:
+    """→ {"active": <id>, "profiles": [ ... ]}（含老扁平结构的懒迁移）。
+
+    🔴 迁移时缺的字段用当期 .env / 环境变量补上：这一步的语义是「把当时的有效配置
+       固化下来」。不补的话，用户原本靠 .env 配好的 base_url / model / max_tokens
+       会正好在迁进 profile 结构时丢掉（迁出方有值、迁入方拿默认值）。
+    """
+    _load_env_file()  # 幂等；迁移分支要读环境变量，不能假设调用方已经加载过
+    declared = "profiles" in ov  # 显式写过 profiles（哪怕是空数组）⇒ 不再回落扁平字段
+    used: set = set()
+    profiles: list[dict] = []
+    if isinstance(ov.get("profiles"), list):
+        for item in ov["profiles"]:
+            p = _norm_profile(item, used)
+            if p:
+                profiles.append(p)
+    if not profiles and not declared:
+        # 老结构（base_url / model / api_keys 在顶层）→ 折成一套，别让用户的配置凭空消失
+        legacy = _norm_profile(
+            {
+                "id": "default",
+                "name": _guess_name(str(_env_or(ov, "base_url") or "")) or "默认配置",
+                "base_url": _env_or(ov, "base_url"),
+                "model": _env_or(ov, "model"),
+                "api_keys": _env_or(ov, "api_keys"),
+                "max_tokens": _env_or(ov, "max_tokens"),
+                "temperature": _env_or(ov, "temperature"),
+                "timeout": _env_or(ov, "timeout"),
+                "json_mode": _env_or(ov, "json_mode"),
+            },
+            used,
+        )
+        if legacy:
+            profiles.append(legacy)
+    active = str(ov.get("active_profile") or "").strip()
+    if not any(p["id"] == active for p in profiles):
+        active = profiles[0]["id"] if profiles else ""
+    return {"active": active, "profiles": profiles}
+
+
+def current_profiles() -> dict:
+    """（内部用）当前设置的归一化视图。"""
+    return _norm_profiles(_read_settings_file())
+
+
+def _active_profile(norm: Optional[dict] = None) -> Optional[dict]:
+    n = norm if norm is not None else current_profiles()
+    for p in n["profiles"]:
+        if p["id"] == n["active"]:
+            return p
+    return None
+
+
+def _active_id() -> str:
+    return current_profiles()["active"]
+
+
+def _profile_creds(profile: dict) -> tuple:
+    """从「配置引用」解析出 (base_url, keys)。
+
+    profile 可以是：已保存配置的 `{id}`、还没保存的草稿 `{id?, base_url, api_keys}`
+    （新建端点时要先看看有哪些模型可选，不能只让用户盲填模型名）。
+    草稿里的脱敏串（含 `*`）按**该配置自己**的 key 池映射回明文 —— 拿别的池匹配会串。
+    """
+    pid = str(profile.get("id") or "").strip()
+    saved: dict = {}
+    if pid:
+        saved = next((p for p in current_profiles()["profiles"] if p["id"] == pid), None) or {}
+    base_url = str(profile.get("base_url") or saved.get("base_url") or "").strip()
+    raw_keys = profile.get("api_keys")
+    if raw_keys is None:
+        keys = list(saved.get("api_keys") or [])
+    else:
+        pool = saved.get("api_keys") or []
+        keys = []
+        for item in raw_keys:
+            s = str(item).strip()
+            if not s:
+                continue
+            if "*" in s:  # 脱敏串 → 映射回该配置池里的真实 key
+                for k in pool:
+                    if mask_key(k) == s and k not in keys:
+                        keys.append(k)
+                        break
+            elif s not in keys:
+                keys.append(s)
+        if not keys:
+            keys = list(pool)
+    return base_url, keys
+
+
+# ---------------------------------------------------------------------------
 # 多 API Key 池 + 自动轮换
 # ---------------------------------------------------------------------------
 # 🔴 为什么要在后端轮换：单 key 限流（429）/ 额度用尽 / 被禁用时，一次长分析
@@ -147,7 +347,10 @@ def _write_settings_file(data: dict) -> None:
 # 标记语义：
 #   · 429 → 冷却 60s 后自动恢复（限流是暂时的）
 #   · 401/403/额度 → 标记失效，直到「重试失效 Key」或改设置才复位
-_KEY_STATE: dict = {"idx": 0, "bad": {}}  # bad: idx -> {"reason": str, "until": float}
+# 🔴 轮换状态必须**按配置分桶**：bad 是按 key 的**下标**记的。共用一份的话，
+#    「MiMo 配置里第 2 个 key 失效」会把「DeepSeek 配置里第 2 个 key」一起标成失效
+#    —— 两个池子毫无关系，白丢一个可用 key。
+_KEY_STATE: dict = {"pool": {}}  # pool: profile_id -> {"idx": int, "bad": {idx: {...}}}
 _COOLDOWN_429 = 60.0
 _ROTATE_STATUS = (401, 403, 429)
 _ROTATE_PAT = re.compile(
@@ -161,6 +364,16 @@ class MultiKeyError(RuntimeError):
     """全部 API Key 都不可用（附带每个 key 的失败原因，给前端直接展示）。"""
 
 
+def _pool_of(profile_id: str) -> dict:
+    """取某套配置的轮换状态桶（懒建）。空 id（还没配任何端点）落进一个公共桶。"""
+    return _KEY_STATE["pool"].setdefault(str(profile_id or "_default"), {"idx": 0, "bad": {}})
+
+
+def _pool() -> dict:
+    """当前激活配置的轮换状态桶。"""
+    return _pool_of(_active_id())
+
+
 def _split_keys(raw: str) -> list[str]:
     """把逗号/空白分隔的 key 串拆成去重列表（兼容 .env 里一格多 key 的填法）。"""
     out: list[str] = []
@@ -172,25 +385,36 @@ def _split_keys(raw: str) -> list[str]:
 
 
 def key_pool() -> list[str]:
-    """当前生效的 key 池：UI 设置优先，回落 .env（支持一格多 key）。"""
+    """当前激活配置的 key 池：UI 设置优先，回落 .env（支持一格多 key）。
+
+    🔴 内置 key 为空时**回落 .env** 是刻意的：老用户的 key 只存在于 `.env`，
+        迁进 profile 结构后这一级不能断，否则升级即「未配置任何 API Key」。
+    """
     _load_env_file()  # 幂等（mtime 缓存）：key_pool 可能先于 config() 被调
-    ov = _read_settings_file()
-    keys = [str(k).strip() for k in (ov.get("api_keys") or []) if str(k).strip()]
+    prof = _active_profile()
+    keys = [str(k).strip() for k in ((prof or {}).get("api_keys") or []) if str(k).strip()]
     if not keys:
         keys = _split_keys(os.environ.get("RETRO_LLM_API_KEY") or "")
     return keys
 
 
 def mask_key(k: str) -> str:
-    """key 脱敏：sk-L7w15y****ab3f（前端列表展示 / 回传映射都靠这个串）。"""
-    if len(k) <= 12:
-        return k[:3] + "****"
+    """key 脱敏：sk-L7w15y****ab3f（前端列表展示 / 回传映射都靠这个串）。
+
+    🔴 短 key 也必须**保留尾部**：只留前 3 位时 `sk-aaa1` 与 `sk-bbb2` 会脱敏成同一个串，
+       而回传保存是按这个串**反查真实 key** 的 —— 撞上就等于把它们认成同一把（静默丢 key）。
+       真实 key 都很长，但开发用的占位 key / 短串一样会走到这条路径。
+    """
+    if len(k) <= 8:
+        return k[:2] + "****" + k[-2:]
+    if len(k) <= 16:
+        return k[:4] + "****" + k[-3:]
     return f"{k[:8]}****{k[-4:]}"
 
 
-def key_usable(idx: int) -> bool:
+def key_usable(idx: int, profile_id: str = "") -> bool:
     """cooldown 到期 = 恢复可用；until=0 = 永久失效（直到「重试失效 Key」或改设置复位）。"""
-    info = _KEY_STATE["bad"].get(idx)
+    info = _pool_of(profile_id or _active_id())["bad"].get(idx)
     if not info:
         return True
     until = info.get("until") or 0
@@ -199,26 +423,55 @@ def key_usable(idx: int) -> bool:
     return time.time() >= until
 
 
-def mark_key_bad(idx: int, reason: str, cooldown: float = 0.0) -> None:
-    _KEY_STATE["bad"][idx] = {"reason": reason, "until": (time.time() + cooldown) if cooldown else 0.0}
+def mark_key_bad(idx: int, reason: str, cooldown: float = 0.0, profile_id: str = "") -> None:
+    _pool_of(profile_id or _active_id())["bad"][idx] = {
+        "reason": reason,
+        "until": (time.time() + cooldown) if cooldown else 0.0,
+    }
 
 
-def reset_key_state() -> None:
-    """清空失效/冷却标记（保存设置 / 手动「重试失效 Key」时调用）。"""
-    _KEY_STATE["idx"] = 0
-    _KEY_STATE["bad"].clear()
+def reset_key_state(profile_id: str = "") -> None:
+    """清空失效/冷却标记（保存设置 / 手动「重试失效 Key」时调用）。
+
+    给了 profile_id 就只清那一套（面板上的按钮作用于当前编辑的配置）；
+    不给 = 全部清（保存设置后调用：配置变了，旧的失效标记一律作废）。
+    """
+    if profile_id:
+        _KEY_STATE["pool"].pop(str(profile_id), None)
+        return
+    _KEY_STATE["pool"].clear()
 
 
-def key_states() -> list[dict]:
-    """给 UI 的 key 池状态（脱敏）：active=使用中 / cooldown=冷却 / bad=失效 / idle=备用。"""
-    keys = key_pool()
+def key_states(profile_id: str = "") -> list[dict]:
+    """给 UI 的 key 池状态（脱敏）：active=使用中 / cooldown=冷却 / bad=失效 / idle=备用。
+
+    不传 profile_id = 当前激活那套的真实状态；传了 = 那套自己的状态
+    （每套各一张表，切换配置时看到的状态不会串）。
+    """
+    if profile_id:
+        uid = str(profile_id)
+        prof = next((p for p in current_profiles()["profiles"] if p["id"] == uid), None)
+        keys = [str(k).strip() for k in ((prof or {}).get("api_keys") or []) if str(k).strip()]
+    else:
+        uid = _active_id()
+        keys = key_pool()
+    pool = _pool_of(uid)
     n = len(keys)
     now = time.time()
+    # 「使用中」= 下一次请求**真正会用到**的那把：从当前下标起第一个可用的 key。
+    # 🔴 不能只标 `pool["idx"]` 指向的那把 —— 它失效时面板会显示成「没有任何 key 在使用中」，
+    #    而实际请求早就顺延到后面的备用 key 了（多 key 轮换最该看清的恰恰是这个）。
+    live = -1
+    for offset in range(n):
+        cand = (pool["idx"] + offset) % n
+        if key_usable(cand, uid):
+            live = cand
+            break
     out: list[dict] = []
     for i, k in enumerate(keys):
-        info = _KEY_STATE["bad"].get(i) or {}
+        info = pool["bad"].get(i) or {}
         until = info.get("until") or 0
-        if n and i == _KEY_STATE["idx"] % n and key_usable(i):
+        if i == live:
             state = "active"
         elif until and until > now:
             state = "cooldown"
@@ -231,20 +484,27 @@ def key_states() -> list[dict]:
 
 
 def config() -> dict:
-    """读当前 LLM 配置（.env + UI 设置合并，UI 设置优先；改完下一次请求即生效）。"""
+    """读**当前激活的端点配置**（改完下一次请求即生效）。
+
+    优先级：profiles[active] → 老的顶层扁平字段 → .env / 环境变量。
+    中间那一级只为兼容「升级前写下的 llm_settings.json」而留。
+    """
     _load_env_file()
     ov = _read_settings_file()
-    base = str(ov.get("base_url") or os.environ.get("RETRO_LLM_BASE_URL") or "").strip().rstrip("/")
-    # 允许填到 /v1 为止，也允许直接填完整的 chat/completions
-    if base and not base.endswith("/chat/completions"):
-        base = base + "/chat/completions"
-    keys = key_pool()
-    idx = _KEY_STATE["idx"] % len(keys) if keys else 0
+    prof = _active_profile(_norm_profiles(ov)) or {}
+
+    def _raw(name: str):
+        v = prof.get(name)
+        if v is None or v == "":
+            v = ov.get(name)
+        if v is None or v == "":
+            v = os.environ.get(f"RETRO_LLM_{name.upper()}")
+        return v
 
     def _num(name: str, env_default: str, cast, lo: float, hi: float):
-        raw = ov.get(name)
+        raw = _raw(name)
         if raw is None or raw == "":
-            raw = os.environ.get(f"RETRO_LLM_{name.upper()}", env_default)
+            raw = env_default
         try:
             v = cast(raw)
         except (TypeError, ValueError):
@@ -252,18 +512,17 @@ def config() -> dict:
         return min(hi, max(lo, v))
 
     def _flag(name: str, env_default: str) -> bool:
-        raw = ov.get(name)
-        if raw is None:
-            raw = os.environ.get(f"RETRO_LLM_{name.upper()}", env_default)
-        if isinstance(raw, bool):
-            return raw
-        return str(raw).strip().lower() not in ("0", "false", "no", "off")
+        return _bool_of(_raw(name), _bool_of(env_default, True))
 
+    keys = key_pool()
+    idx = _pool()["idx"] % len(keys) if keys else 0
     return {
-        "base_url": base,
+        "profile_id": str(prof.get("id") or ""),
+        "profile_name": str(prof.get("name") or ""),
+        "base_url": _chat_url(str(_raw("base_url") or "")),
         "api_keys": keys,
         "api_key": keys[idx] if keys else "",  # 当前活跃 key（向后兼容旧调用方）
-        "model": str(ov.get("model") or os.environ.get("RETRO_LLM_MODEL") or "").strip(),
+        "model": str(_raw("model") or "").strip(),
         "timeout": _num("timeout", "180", float, 5.0, 3600.0),
         "max_tokens": int(_num("max_tokens", "8192", int, 16, 1_000_000)),
         "json_mode": _flag("json_mode", "1"),
@@ -281,6 +540,8 @@ def public_status() -> dict:
     c = config()
     return {
         "configured": is_configured(),
+        "profile_id": c["profile_id"],
+        "profile_name": c["profile_name"],
         "base_url": c["base_url"],
         "model": c["model"],
         "has_key": bool(c["api_keys"]),
@@ -288,75 +549,156 @@ def public_status() -> dict:
         "max_tokens": c["max_tokens"],
         "json_mode": c["json_mode"],
         "hint": "" if is_configured() else (
-            "请在下方「API 设置」里填 接口地址 / API Key / 模型"
-            "（或编辑 web/.env 的 RETRO_LLM_*，改完立即生效，无需重启）。"
+            "请在「运行参数 → 大模型设置 → 端点配置」里新建一套：接口地址 / 模型 / API Key 会绑在一起"
+            "（也可以编辑 web/.env 的 RETRO_LLM_*，改完立即生效，无需重启）。"
         ),
     }
 
 
 def get_settings() -> dict:
-    """设置面板的当前值（key 脱敏回传）。base_url 给编辑态（不带 /chat/completions 后缀）。"""
+    """设置面板的当前值：全部端点配置（key 脱敏回传）+ 当前激活那套的展开字段。
+
+    `base_url / model / ... / keys` 这几个扁平字段与 `profiles[active]` 等价，
+    是给「只关心当前配置」的老界面留的兼容形态。
+    """
     _load_env_file()
     ov = _read_settings_file()
+    norm = _norm_profiles(ov)
+    prof = _active_profile(norm) or {}
     c = config()
+    profiles: list[dict] = []
+    for p in norm["profiles"]:
+        profiles.append(
+            {
+                "id": p["id"],
+                "name": p["name"],
+                "base_url": p["base_url"],
+                "model": p["model"],
+                "max_tokens": p["max_tokens"],
+                "temperature": p["temperature"],
+                "timeout": p["timeout"],
+                "json_mode": p["json_mode"],
+                "note": p["note"],
+                "keys": key_states(p["id"]),
+                "active": p["id"] == norm["active"],
+            }
+        )
     return {
         "ok": True,
-        "base_url": str(ov.get("base_url") or os.environ.get("RETRO_LLM_BASE_URL") or "").strip(),
+        "active_profile": norm["active"],
+        "profiles": profiles,
+        # —— 兼容形态：当前激活配置的展开 ——
+        "base_url": str(prof.get("base_url") or os.environ.get("RETRO_LLM_BASE_URL") or "").strip(),
         "model": c["model"],
         "max_tokens": c["max_tokens"],
         "temperature": c["temperature"],
         "timeout": int(c["timeout"]),
         "json_mode": c["json_mode"],
         "keys": key_states(),
-        "active_index": _KEY_STATE["idx"],
+        "active_index": _pool()["idx"],
     }
 
 
 def save_settings(payload: dict) -> dict:
-    """保存 UI 设置 → llm_settings.json（优先级高于 .env），并复位 key 轮换状态。
+    """保存设置面板 → web/llm_settings.json（优先级高于 .env），并复位 key 轮换。
 
-    api_keys 语义：数组元素含 `*` 视为「保留原 key」（按脱敏串匹配现有 key 池）；
-    明文元素 = 新增/替换。全部过滤空值并去重。
-    🔴 UI 传空列表 = 回落到 .env 的 key（想清空请直接编辑 .env）。
+    两种 payload 形态：
+      · **整包**（新）：`{profiles: [...], active_profile: "<id>"}` —— 增 / 改 / 删都走它，
+        提交什么就是什么（删掉一套 = 数组里没有它）。
+      · **扁平**（老界面兼容）：`{base_url, model, api_keys, ...}` —— 合并进当前激活那套。
+
+    每套里的 `api_keys`：元素含 `*` = 按脱敏串保留该套已有的 key；明文 = 新增 / 替换。
+    🔴 脱敏串优先只在**它自己那套**的 key 池里匹配 —— 跨配置乱匹配会取到别家的 key。
     """
     ov = _read_settings_file()
-    cur_keys = key_pool()
+    saved = {p["id"]: p for p in _norm_profiles(ov)["profiles"]}
 
-    if "api_keys" in payload:
-        new_keys: list[str] = []
-        for item in payload.get("api_keys") or []:
+    def _resolve(items, pid: str) -> list[str]:
+        own = (saved.get(pid) or {}).get("api_keys") or []
+        others: list[str] = []
+        for other_id, p in saved.items():
+            if other_id != pid:
+                others.extend(p.get("api_keys") or [])
+        out: list[str] = []
+        for item in items or []:
             s = str(item).strip()
             if not s:
                 continue
-            if "*" in s:  # 脱敏串 → 映射回现有池里的真实 key
-                for k in cur_keys:
-                    if mask_key(k) == s and k not in new_keys:
-                        new_keys.append(k)
-                        break
-            elif s not in new_keys:
-                new_keys.append(s)
-        ov["api_keys"] = new_keys
+            if "*" not in s:  # 明文 = 直接采用
+                if s not in out:
+                    out.append(s)
+                continue
+            hit = next((k for k in own if mask_key(k) == s), "")
+            if not hit:
+                # 「复制配置」场景：新 id 的池是空的，脱敏串得回溯到别处 —— 只认**唯一**匹配
+                cand = {k for k in others if mask_key(k) == s}
+                if len(cand) == 1:
+                    hit = cand.pop()
+            if hit and hit not in out:
+                out.append(hit)
+        return out
 
-    if "base_url" in payload:
-        ov["base_url"] = str(payload.get("base_url") or "").strip()
-    if "model" in payload:
-        ov["model"] = str(payload.get("model") or "").strip()
-    for num in ("max_tokens", "timeout"):
-        if payload.get(num) is not None:
-            try:
-                ov[num] = max(1, int(payload[num]))
-            except (TypeError, ValueError):
-                pass
-    if payload.get("temperature") is not None:
-        try:
-            ov["temperature"] = min(2.0, max(0.0, float(payload["temperature"])))
-        except (TypeError, ValueError):
-            pass
-    if payload.get("json_mode") is not None:
-        ov["json_mode"] = bool(payload["json_mode"])
+    rows: list = []
+    active_in = ""
+    if isinstance(payload.get("profiles"), list):
+        rows = payload["profiles"]
+        active_in = str(payload.get("active_profile") or "").strip()
+    else:
+        # 老界面：扁平字段只改**当前激活**那套。🔴 其它配置必须原样保留 ——
+        # 否则一次老的保存动作会把用户新建的其它端点整片删掉（数组被覆盖成单项）。
+        aid = current_profiles()["active"]
+        merged = dict(saved.get(aid) or {"id": aid or "default", "name": "默认配置"})
+        for key in ("base_url", "model", "max_tokens", "temperature", "timeout", "json_mode", "note"):
+            if payload.get(key) is not None:
+                merged[key] = payload[key]
+        if "api_keys" in payload:
+            merged["api_keys"] = _resolve(payload["api_keys"], aid)
+        rows = [dict(saved[k]) for k in saved]
+        hit = next((i for i, r in enumerate(rows) if str(r.get("id") or "").strip() == aid), -1)
+        if hit >= 0:
+            rows[hit] = merged  # 顺序不变：面板里的排列不会因为一次保存而跳动
+        else:
+            rows.append(merged)
+        active_in = aid
 
+    used: set = set()
+    id_map: dict = {}  # 前端给的 id → 归一化后的 id（slug 化可能改写法）
+    profiles: list[dict] = []
+    for raw in rows:
+        if not isinstance(raw, dict):
+            continue
+        item = dict(raw)
+        pid_raw = str(item.get("id") or "").strip()
+        if isinstance(item.get("api_keys"), list):
+            item["api_keys"] = _resolve(item["api_keys"], pid_raw)
+        p = _norm_profile(item, used)
+        if p:
+            if pid_raw:
+                id_map[pid_raw] = p["id"]
+            profiles.append(p)
+
+    active = id_map.get(active_in, active_in)
+    if not any(p["id"] == active for p in profiles):
+        active = profiles[0]["id"] if profiles else ""
+    # 🔴 落盘只写新形态：顶层扁平字段一旦留着就等于多出一套「隐藏配置」，
+    #    在用户删光全部配置后会被迁移分支复活。
+    _write_settings_file({"active_profile": active, "profiles": profiles})
+    reset_key_state()  # 配置变了，旧的失效标记全部作废
+    return get_settings()
+
+
+def activate_profile(profile_id: str) -> dict:
+    """切换当前使用的端点配置（只改 active_profile）→ 下一次请求立即生效，无需保存。"""
+    pid = str(profile_id or "").strip()
+    ov = _read_settings_file()
+    if not any(p["id"] == pid for p in _norm_profiles(ov)["profiles"]):
+        out = get_settings()
+        out["ok"] = False
+        out["error"] = f"没有这个端点配置：{profile_id or '(空)'}"
+        return out
+    ov = dict(ov)
+    ov["active_profile"] = pid
     _write_settings_file(ov)
-    reset_key_state()  # key 池/配置变了，旧的失效标记全部作废
     return get_settings()
 
 
@@ -524,14 +866,19 @@ def request_chat(
     keys = cfg["api_keys"]
     n = len(keys)
     if not n:
-        raise MultiKeyError("未配置任何 API Key（在「API 设置」里添加，或填 .env 的 RETRO_LLM_API_KEY）")
+        raise MultiKeyError(
+            "这套端点配置里没有任何 API Key（在「运行参数 → 大模型设置 → 端点配置」里添加，"
+            "或填 .env 的 RETRO_LLM_API_KEY）"
+        )
+    pid = str(cfg.get("profile_id") or "")
+    pool = _pool_of(pid)  # 🔴 轮换状态按配置分桶，别串到另一套的 key 上
     notes: list[str] = []
-    start = _KEY_STATE["idx"] % n
+    start = pool["idx"] % n
     resp = None
     for offset in range(n):
         idx = (start + offset) % n
-        if not key_usable(idx):
-            info = _KEY_STATE["bad"].get(idx) or {}
+        if not key_usable(idx, pid):
+            info = pool["bad"].get(idx) or {}
             notes.append(f"#{idx + 1} {mask_key(keys[idx])} 跳过（{(info.get('reason') or '已标记失效')[:60]}）")
             continue
         resp = _request(
@@ -547,11 +894,11 @@ def request_chat(
             resp.status_code >= 400 and _ROTATE_PAT.search(_error_text(resp))
         ):
             reason = _error_text(resp)
-            mark_key_bad(idx, reason[:200], _COOLDOWN_429 if resp.status_code == 429 else 0.0)
+            mark_key_bad(idx, reason[:200], _COOLDOWN_429 if resp.status_code == 429 else 0.0, pid)
             notes.append(f"#{idx + 1} {mask_key(keys[idx])} → {reason[:120]}")
             resp = None
             continue
-        _KEY_STATE["idx"] = idx  # 记住可用的 key，下次请求从它开始
+        pool["idx"] = idx  # 记住可用的 key，下次请求从它开始
         return resp, idx
     raise MultiKeyError(
         f"全部 {n} 个 API Key 均不可用。" + ("；".join(notes) if notes else "")
@@ -565,8 +912,17 @@ def probe() -> dict:
     要等到跑完整分析才报错 —— 那可能是几分钟之后。这个探针把它变成秒级的明确答案。
     """
     cfg = config()
+    pid = str(cfg.get("profile_id") or "")
+    pname = str(cfg.get("profile_name") or "")
+
+    def _out(payload: dict) -> dict:
+        """每条返回都带上「验的是哪套配置」—— 多套端点并存时，光看 key/模型名认不出来。"""
+        payload["profile_id"] = pid
+        payload["profile_name"] = pname
+        return payload
+
     if not cfg["model"] or not cfg["base_url"] or not cfg["api_keys"]:
-        return {"ok": False, "verified": False, "error": public_status()["hint"]}
+        return _out({"ok": False, "verified": False, "error": public_status()["hint"]})
     prox = proxies_setting()
     mode = "直连" if prox == _DIRECT else ("环境代理/未指定" if prox is None else "指定代理")
     tried: list[str] = []
@@ -584,40 +940,55 @@ def probe() -> dict:
             tried=tried,
         )
     except MultiKeyError as e:
-        return {"ok": False, "verified": False, "error": str(e), "model": cfg["model"]}
+        return _out({"ok": False, "verified": False, "error": str(e), "model": cfg["model"]})
     except Exception as e:  # noqa: BLE001
         if _is_transient(e):
-            return {
-                "ok": False,
-                "verified": False,
-                "error": network_error_text(e, tried, cfg["base_url"]),
-                "model": cfg["model"],
-                "proxy_mode": mode,
-            }
-        return {"ok": False, "verified": False, "error": f"{type(e).__name__}: {e}", "model": cfg["model"]}
+            return _out(
+                {
+                    "ok": False,
+                    "verified": False,
+                    "error": network_error_text(e, tried, cfg["base_url"]),
+                    "model": cfg["model"],
+                    "proxy_mode": mode,
+                }
+            )
+        return _out(
+            {"ok": False, "verified": False, "error": f"{type(e).__name__}: {e}", "model": cfg["model"]}
+        )
     if resp.status_code >= 400:
-        return {"ok": False, "verified": False, "error": _error_text(resp), "model": cfg["model"]}
-    return {
-        "ok": True,
-        "verified": True,
-        "model": cfg["model"],
-        "base_url": cfg["base_url"],
-        "key": mask_key(cfg["api_keys"][key_idx]),
-        "proxy_mode": mode,
-        "latency_hint": "ok",
-    }
+        return _out({"ok": False, "verified": False, "error": _error_text(resp), "model": cfg["model"]})
+    return _out(
+        {
+            "ok": True,
+            "verified": True,
+            "model": cfg["model"],
+            "base_url": cfg["base_url"],
+            "key": mask_key(cfg["api_keys"][key_idx]),
+            "proxy_mode": mode,
+            "latency_hint": "ok",
+        }
+    )
 
 
-def list_models() -> dict:
-    """列出该 key 能看到的模型，并逐个标注是否**真的能调**。
+def list_models(profile: Optional[dict] = None) -> dict:
+    """列出这套配置的 key 能看到的模型。
 
     🔴 只看 `/v1/models` 会被骗：它会列出「存在但不在当前套餐内」的模型
     （实测 `deepseek-v4.1-flash` 就出现在列表里，一调就 permission_denied）。
+
+    profile 不传 = 当前激活那套；传 `{"id": "<已保存的 id>"}` = 指那套；
+    传 `{"base_url": ..., "api_keys": [...]}` = **还没保存的草稿** ——
+    新建端点时得先看看有哪些模型可选，否则只能盲填模型名。
     """
-    cfg = config()
-    if not cfg["api_key"] or not cfg["base_url"]:
+    if profile:
+        base_url, keys = _profile_creds(profile)
+        key = keys[0] if keys else ""
+    else:
+        cfg = config()
+        base_url, key = cfg["base_url"], cfg["api_key"]
+    if not key or not base_url:
         return {"ok": False, "error": public_status()["hint"], "models": []}
-    root = cfg["base_url"]
+    root = base_url
     for suffix in ("/chat/completions", "/completions"):
         if root.endswith(suffix):
             root = root[: -len(suffix)]
@@ -627,7 +998,7 @@ def list_models() -> dict:
         resp = _request(
             "GET",
             root + "/models",
-            headers={"Authorization": f"Bearer {cfg['api_key']}"},
+            headers={"Authorization": f"Bearer {key}"},
             timeout=30,
             tried=tried,
         )
