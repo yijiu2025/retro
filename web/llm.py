@@ -210,7 +210,14 @@ def _norm_profile(raw: object, used: set) -> Optional[dict]:
         return None
     base_url = str(raw.get("base_url") or "").strip()
     model = str(raw.get("model") or "").strip()
-    keys = [str(k).strip() for k in (raw.get("api_keys") or []) if str(k).strip()]
+    # 🔴 `api_keys` 可能是**字符串**（手写的 llm_settings.json、或从环境变量直接读来的）——
+    #    直接 `for k in raw_keys` 会把 "sk-a,sk-b" 拆成一个个**字符**，变成一堆单字符假 key。
+    raw_keys = raw.get("api_keys")
+    keys = (
+        _split_keys(raw_keys)
+        if isinstance(raw_keys, str)
+        else [str(k).strip() for k in (raw_keys or []) if str(k).strip()]
+    )
     name = str(raw.get("name") or "").strip()
     if not (base_url or model or keys or name):
         return None
@@ -267,7 +274,10 @@ def _norm_profiles(ov: dict) -> dict:
                 "name": _guess_name(str(_env_or(ov, "base_url") or "")) or "默认配置",
                 "base_url": _env_or(ov, "base_url"),
                 "model": _env_or(ov, "model"),
-                "api_keys": _env_or(ov, "api_keys"),
+                # 🔴 顶层扁平字段（升级前写的 llm_settings.json）优先；都没有才从
+                #    `.env` 的 key 池取 —— 名字必须走 `_env_keys()` 的双名回落，
+                #    直接 `_env_or(ov, "api_keys")` 只会找 `RETRO_LLM_API_KEYS` 而漏掉单数。
+                "api_keys": ov.get("api_keys") or _env_keys(),
                 "max_tokens": _env_or(ov, "max_tokens"),
                 "temperature": _env_or(ov, "temperature"),
                 "timeout": _env_or(ov, "timeout"),
@@ -384,6 +394,22 @@ def _split_keys(raw: str) -> list[str]:
     return out
 
 
+def _env_keys() -> list[str]:
+    """环境变量里的 key 池（回落链的最后一级）。
+
+    🔴 名字有**两个**，必须都认：
+      · `RETRO_LLM_API_KEYS`（复数）—— 与前缀约定 `RETRO_LLM_<字段名>` 一致（字段叫 api_keys）；
+      · `RETRO_LLM_API_KEY`（单数）—— README / `.env.example` 里写的、用户手上 `.env` 里
+        一直用的就是这个名字。
+    只认复数会踩一个很迷惑的坑：配置文件从 `.env` **懒迁移**成 profile 时 key 静默丢失，
+    面板显示「API Keys（0）」而实际请求照常跑（`key_pool()` 有单数回落）——
+    于是用户看到「没 key 却能分析」、「保存被拦（至少一个 Key 必填）」。
+    """
+    return _split_keys(os.environ.get("RETRO_LLM_API_KEYS") or "") or _split_keys(
+        os.environ.get("RETRO_LLM_API_KEY") or ""
+    )
+
+
 def key_pool() -> list[str]:
     """当前激活配置的 key 池：UI 设置优先，回落 .env（支持一格多 key）。
 
@@ -394,7 +420,7 @@ def key_pool() -> list[str]:
     prof = _active_profile()
     keys = [str(k).strip() for k in ((prof or {}).get("api_keys") or []) if str(k).strip()]
     if not keys:
-        keys = _split_keys(os.environ.get("RETRO_LLM_API_KEY") or "")
+        keys = _env_keys()
     return keys
 
 
@@ -442,19 +468,38 @@ def reset_key_state(profile_id: str = "") -> None:
     _KEY_STATE["pool"].clear()
 
 
-def key_states(profile_id: str = "") -> list[dict]:
+def _pool_keys(p: Optional[dict], active: bool) -> list[tuple[str, str]]:
+    """某套配置的 key 池 + **每把的来源**：`[("sk-…", "profile"), ("sk-…", "env")]`。
+
+    🔴 激活那套要带上 `.env` 回落 —— 那正是 `key_pool()` 拿去发请求的那把。
+       只回显 `profiles[].api_keys` 里的数组，就会出现
+       「面板写 API Keys（0）· 保存被『至少一个 Key 必填』拦住 · 模型却跑得动」三头矛盾
+       （一条链上的两处名字/口径不一致，实测踩到）。
+    🔴 来源必须标出来：`.env` 那把**删不掉**（它是回落默认值，要改 .env 才生效），
+       UI 因此不给删除按钮 —— 否则又是一个「看着能删、其实删不掉」。
+    """
+    own = [str(k).strip() for k in ((p or {}).get("api_keys") or []) if str(k).strip()]
+    if own or not active:
+        return [(k, "profile") for k in own]
+    return [(k, "env") for k in _env_keys()]
+
+
+def key_states(profile_id: str = "", keys: Optional[list] = None) -> list[dict]:
     """给 UI 的 key 池状态（脱敏）：active=使用中 / cooldown=冷却 / bad=失效 / idle=备用。
 
     不传 profile_id = 当前激活那套的真实状态；传了 = 那套自己的状态
     （每套各一张表，切换配置时看到的状态不会串）。
+    `keys` 可显式传（元素是 `(key, 来源)`），不传就按该套的池算 —— 见 `_pool_keys`。
     """
     if profile_id:
         uid = str(profile_id)
-        prof = next((p for p in current_profiles()["profiles"] if p["id"] == uid), None)
-        keys = [str(k).strip() for k in ((prof or {}).get("api_keys") or []) if str(k).strip()]
+        if keys is None:
+            prof = next((p for p in current_profiles()["profiles"] if p["id"] == uid), None)
+            keys = _pool_keys(prof, uid == _active_id())
     else:
         uid = _active_id()
-        keys = key_pool()
+        if keys is None:
+            keys = _pool_keys(_active_profile(), True)
     pool = _pool_of(uid)
     n = len(keys)
     now = time.time()
@@ -468,7 +513,8 @@ def key_states(profile_id: str = "") -> list[dict]:
             live = cand
             break
     out: list[dict] = []
-    for i, k in enumerate(keys):
+    for i, item in enumerate(keys):
+        k, src = item if isinstance(item, (tuple, list)) else (item, "profile")
         info = pool["bad"].get(i) or {}
         until = info.get("until") or 0
         if i == live:
@@ -479,7 +525,14 @@ def key_states(profile_id: str = "") -> list[dict]:
             state = "bad"
         else:
             state = "idle"
-        out.append({"masked": mask_key(k), "state": state, "reason": str(info.get("reason") or "")})
+        out.append(
+            {
+                "masked": mask_key(str(k)),
+                "state": state,
+                "reason": str(info.get("reason") or ""),
+                "source": str(src),
+            }
+        )
     return out
 
 
@@ -609,11 +662,14 @@ def save_settings(payload: dict) -> dict:
 
     每套里的 `api_keys`：元素含 `*` = 按脱敏串保留该套已有的 key；明文 = 新增 / 替换。
     🔴 脱敏串优先只在**它自己那套**的 key 池里匹配 —— 跨配置乱匹配会取到别家的 key。
+    🔴 再兜一级：**激活那套**允许从 `.env` 的 key 池里认领。面板把 .env 那把（回落默认值）
+       列在「API Keys」里，用户点「保存设置」就是想把它固定下来；不认领就等于
+       「面板上有、一保存就没了」，而且文件里从此留下一份空池（实测：本机就这么被写坏的）。
     """
     ov = _read_settings_file()
     saved = {p["id"]: p for p in _norm_profiles(ov)["profiles"]}
 
-    def _resolve(items, pid: str) -> list[str]:
+    def _resolve(items, pid: str, allow_env: bool = False) -> list[str]:
         own = (saved.get(pid) or {}).get("api_keys") or []
         others: list[str] = []
         for other_id, p in saved.items():
@@ -634,6 +690,9 @@ def save_settings(payload: dict) -> dict:
                 cand = {k for k in others if mask_key(k) == s}
                 if len(cand) == 1:
                     hit = cand.pop()
+            if not hit and allow_env:
+                # 激活那套的最后一级回落：面板上那把本来就是从 .env 来的（见 _pool_keys）
+                hit = next((k for k in _env_keys() if mask_key(k) == s), "")
             if hit and hit not in out:
                 out.append(hit)
         return out
@@ -652,7 +711,7 @@ def save_settings(payload: dict) -> dict:
             if payload.get(key) is not None:
                 merged[key] = payload[key]
         if "api_keys" in payload:
-            merged["api_keys"] = _resolve(payload["api_keys"], aid)
+            merged["api_keys"] = _resolve(payload["api_keys"], aid, allow_env=True)
         rows = [dict(saved[k]) for k in saved]
         hit = next((i for i, r in enumerate(rows) if str(r.get("id") or "").strip() == aid), -1)
         if hit >= 0:
@@ -670,7 +729,7 @@ def save_settings(payload: dict) -> dict:
         item = dict(raw)
         pid_raw = str(item.get("id") or "").strip()
         if isinstance(item.get("api_keys"), list):
-            item["api_keys"] = _resolve(item["api_keys"], pid_raw)
+            item["api_keys"] = _resolve(item["api_keys"], pid_raw, allow_env=pid_raw == active_in)
         p = _norm_profile(item, used)
         if p:
             if pid_raw:
