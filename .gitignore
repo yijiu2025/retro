@@ -5,6 +5,7 @@ models/
 # === 真实密钥（只提交 .env.example）===
 web/.env
 .env
+web/llm_settings.json
 
 # === Python 产物 ===
 __pycache__/
