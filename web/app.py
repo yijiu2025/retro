@@ -585,8 +585,12 @@ _API_INDEX = {
         {"method": "POST", "path": "/api/jobs/<job_id>/cancel", "desc": "取消任务"},
         {"method": "GET", "path": "/api/llm/status", "desc": "大模型配置状态（?probe=1 真实验证）"},
         {"method": "GET", "path": "/api/llm/models", "desc": "该 key 下可见的模型"},
+        {"method": "GET", "path": "/api/llm/settings", "desc": "大模型设置（key 脱敏）"},
+        {"method": "POST", "path": "/api/llm/settings", "desc": "保存大模型设置（含多 key 池，立即生效）"},
+        {"method": "POST", "path": "/api/llm/keys/reset", "desc": "重试失效 Key（清空失效/冷却标记）"},
         {"method": "POST", "path": "/api/llm/analyze", "desc": "工艺分析（一次性返回）"},
         {"method": "POST", "path": "/api/llm/analyze/stream", "desc": "工艺分析（SSE 流式）"},
+        {"method": "POST", "path": "/api/llm/followup/stream", "desc": "工艺分析追问（SSE，携带上下文自由回答）"},
     ],
 }
 
@@ -924,12 +928,50 @@ def _llm_payload():
     precursors = data.get("precursors") or []
     if isinstance(precursors, str):
         precursors = [p for p in precursors.split(".") if p]
+    # 前端勾选的分析模块（白名单过滤，未传 = 全量）
+    modules = data.get("modules") or []
+    if isinstance(modules, str):
+        modules = [m for m in modules.split(",") if m]
+    modules = [str(m).strip() for m in modules if str(m).strip()]
     return {
         "product": str(data.get("product") or "").strip(),
         "precursors": [str(p).strip() for p in precursors if str(p).strip()],
         "probability": data.get("probability"),
         "model": str(data.get("model") or ""),
         "context": data.get("context") or {},
+        "continue_from": str(data.get("continue_from") or "").strip(),
+        "modules": modules,
+    }
+
+
+def _llm_followup_payload():
+    """追问请求体：这一步反应上下文 + 已有分析 + 历史问答 + 本次问题。
+
+    🔴 追问要「携带上下文」，所以除了产物/前体/路线，还要把**上一次抽出的结构化分析**
+       与**历史问答**一起带上 —— 否则模型每次都在答新问题，接不上前文。
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    precursors = data.get("precursors") or []
+    if isinstance(precursors, str):
+        precursors = [p for p in precursors.split(".") if p]
+    history = []
+    for m in data.get("history") or []:
+        if not isinstance(m, dict):
+            continue
+        role = str(m.get("role") or "")
+        content = str(m.get("content") or "").strip()
+        if role in ("user", "assistant") and content:
+            history.append({"role": role, "content": content[:4000]})
+    analysis = data.get("analysis")
+    return {
+        "product": str(data.get("product") or "").strip(),
+        "precursors": [str(p).strip() for p in precursors if str(p).strip()],
+        "probability": data.get("probability"),
+        "model": str(data.get("model") or ""),
+        "context": data.get("context") or {},
+        "analysis": analysis if isinstance(analysis, dict) else None,
+        "history": history,
+        "question": str(data.get("question") or "").strip(),
     }
 
 
@@ -956,6 +998,38 @@ def api_llm_models():
     out = llm.list_models()
     out["current"] = llm.config().get("model")
     return jsonify(out)
+
+
+@app.route("/api/llm/settings")
+def api_llm_settings():
+    """设置面板的当前值（key 脱敏）：接口地址 / 模型 / token 上限 / key 池状态。"""
+    if llm is None:
+        return jsonify({"ok": False, "error": "后端未启用大模型模块"})
+    return jsonify(llm.get_settings())
+
+
+@app.route("/api/llm/settings", methods=["POST"])
+def api_llm_settings_save():
+    """保存设置面板 → web/llm_settings.json（优先级高于 .env，立即生效），复位 key 轮换。
+
+    api_keys 元素含 `*` = 按脱敏串保留原 key；明文 = 新增。返回保存后的设置 + 最新状态，
+    前端可以一次拿全、不用再打 /llm/status。
+    """
+    if llm is None:
+        return jsonify({"ok": False, "error": "后端未启用大模型模块"})
+    payload = request.get_json(force=True, silent=True) or {}
+    out = llm.save_settings(payload)
+    out["status"] = llm.public_status()
+    return jsonify(out)
+
+
+@app.route("/api/llm/keys/reset", methods=["POST"])
+def api_llm_keys_reset():
+    """清空 key 的失效/冷却标记（「重试失效 Key」按钮）：全部 key 立即重新可用。"""
+    if llm is None:
+        return jsonify({"ok": False, "error": "后端未启用大模型模块"})
+    llm.reset_key_state()
+    return jsonify(llm.get_settings())
 
 
 @app.route("/api/llm/analyze", methods=["POST"])
@@ -994,6 +1068,32 @@ def api_llm_analyze_stream():
     }
     return Response(
         llm.stream_analyze(req),
+        mimetype="text/event-stream",
+        headers=headers,
+    )
+
+
+@app.route("/api/llm/followup/stream", methods=["POST"])
+def api_llm_followup_stream():
+    """工艺分析「追问」（SSE）：带着这一步反应的上下文与已有分析，回答用户的其他问题。
+
+    🔴 与 /api/llm/analyze/stream 的关键差别：那条要求模型吐**结构化 JSON**（response_format=json_object），
+       这条要的是**自由文本**回答 ⇒ 后端必须显式关掉 json 模式（见 llm.stream_followup）。
+       否则模型会把答案塞进 JSON 字符串里，读起来全是转义符。
+    """
+    if llm is None:
+        return jsonify({"ok": False, "error": "后端未启用大模型模块"}), 500
+    req = _llm_followup_payload()
+    if not req["question"]:
+        return jsonify({"ok": False, "error": "缺少追问内容"}), 400
+
+    headers = {
+        "Cache-Control": "no-cache, no-transform",
+        "X-Accel-Buffering": "no",
+        "Connection": "keep-alive",
+    }
+    return Response(
+        llm.stream_followup(req),
         mimetype="text/event-stream",
         headers=headers,
     )
