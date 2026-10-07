@@ -314,19 +314,30 @@ def _profile_creds(profile: dict) -> tuple:
     """从「配置引用」解析出 (base_url, keys)。
 
     profile 可以是：已保存配置的 `{id}`、还没保存的草稿 `{id?, base_url, api_keys}`
-    （新建端点时要先看看有哪些模型可选，不能只让用户盲填模型名）。
+    （新建端点时要能先看看有哪些模型可选，不能只让用户盲填模型名）。
     草稿里的脱敏串（含 `*`）按**该配置自己**的 key 池映射回明文 —— 拿别的池匹配会串。
+
+    🔴 池为空时**只给「激活那套」回落 `.env`**（`key_pool()` 也是只对激活那套回落）。
+       不补这一级 ⇒ 「`profiles[].api_keys` 是空的、key 只在 `.env`」的配置：
+       面板显示（走 `_pool_keys`，它补了 .env）是对的，拉模型（走这里）却拿不到 key。
+       同一份真值两处口径不一致，症状 = 「拉取返回空列表，错误信息还是空串」。
+       非激活那套**不能**回落：那等于把激活那套的 key 当成它的，与保存时的
+       `allow_env` 口径相反（会出现「拉得到模型、保存却说没 key」）。
     """
+    norm = current_profiles()  # 一次读盘，active 与 profiles 取同一份快照
     pid = str(profile.get("id") or "").strip()
     saved: dict = {}
     if pid:
-        saved = next((p for p in current_profiles()["profiles"] if p["id"] == pid), None) or {}
+        saved = next((p for p in norm["profiles"] if p["id"] == pid), None) or {}
     base_url = str(profile.get("base_url") or saved.get("base_url") or "").strip()
+    # 池 = 这套自己存的 key（空则按上面说明回落 .env）
+    pool = [str(k).strip() for k in (saved.get("api_keys") or []) if str(k).strip()]
+    if not pool and pid and pid == norm["active"]:
+        pool = _env_keys()
     raw_keys = profile.get("api_keys")
     if raw_keys is None:
-        keys = list(saved.get("api_keys") or [])
+        keys = list(pool)
     else:
-        pool = saved.get("api_keys") or []
         keys = []
         for item in raw_keys:
             s = str(item).strip()
@@ -1038,37 +1049,70 @@ def list_models(profile: Optional[dict] = None) -> dict:
     profile 不传 = 当前激活那套；传 `{"id": "<已保存的 id>"}` = 指那套；
     传 `{"base_url": ..., "api_keys": [...]}` = **还没保存的草稿** ——
     新建端点时得先看看有哪些模型可选，否则只能盲填模型名。
+
+    🔴 **多把 key 必须轮换**：只试 `keys[0]` 时，第一把失效/冷却就整条拉取失败，
+       而真正发请求的链路（key 轮换）早就顺延到后面那把了 —— 又一处
+       「拉取口径 ≠ 运行时口径」。只有鉴权类（401/403）与限流（429）才换下一把，
+       其余状态码换 key 也不会变好，如实返回、不白打请求。
     """
     if profile:
         base_url, keys = _profile_creds(profile)
-        key = keys[0] if keys else ""
     else:
         cfg = config()
-        base_url, key = cfg["base_url"], cfg["api_key"]
-    if not key or not base_url:
-        return {"ok": False, "error": public_status()["hint"], "models": []}
+        base_url = cfg["base_url"]
+        # 从**当前活跃那把**开始（运行时下一次请求就用它），再顺延池里其余，去重
+        keys = []
+        for k in [cfg.get("api_key") or ""] + list(cfg.get("api_keys") or []):
+            if k and k not in keys:
+                keys.append(k)
+    # 🔴 配错时**不能**回 `public_status()["hint"]` —— 已配置的实例里那个 hint 是空串，
+    #    前端只能弹一句毫无信息量的「拉取失败」。这里必须说清是哪一项缺。
+    if not base_url:
+        return {"ok": False, "error": "这套端点配置还没填接口地址（base_url）", "models": []}
+    if not keys:
+        return {
+            "ok": False,
+            "error": "这套端点配置还没有可用的 API Key"
+            "（若它是当前激活那套，也可以在 web/.env 里配 RETRO_LLM_API_KEY）",
+            "models": [],
+        }
     root = base_url
     for suffix in ("/chat/completions", "/completions"):
         if root.endswith(suffix):
             root = root[: -len(suffix)]
             break
     tried: list[str] = []
-    try:
-        resp = _request(
-            "GET",
-            root + "/models",
-            headers={"Authorization": f"Bearer {key}"},
-            timeout=30,
-            tried=tried,
-        )
-        if resp.status_code >= 400:
-            return {"ok": False, "error": _error_text(resp), "models": []}
-        rows = (resp.json() or {}).get("data") or []
-        return {"ok": True, "models": [str(m.get("id")) for m in rows if m.get("id")]}
-    except Exception as e:  # noqa: BLE001
-        if _is_transient(e):
-            return {"ok": False, "error": network_error_text(e, tried, root + "/models"), "models": []}
-        return {"ok": False, "error": f"{type(e).__name__}: {e}", "models": []}
+    errors: list[str] = []
+    for key in keys:
+        try:
+            resp = _request(
+                "GET",
+                root + "/models",
+                headers={"Authorization": f"Bearer {key}"},
+                timeout=30,
+                tried=tried,
+            )
+        except Exception as e:  # noqa: BLE001
+            if _is_transient(e):
+                # 网络层的问题换 key 救不了，如实报（诊断信息在 tried 里）
+                return {
+                    "ok": False,
+                    "error": network_error_text(e, tried, root + "/models"),
+                    "models": [],
+                }
+            errors.append(f"{mask_key(key)}: {type(e).__name__}: {e}")
+            continue
+        if resp.status_code < 400:
+            rows = (resp.json() or {}).get("data") or []
+            return {
+                "ok": True,
+                "models": [str(m.get("id")) for m in rows if m.get("id")],
+                "key": mask_key(key),  # 回传脱敏串：多把 key 时得让人知道是哪把拉到的
+            }
+        errors.append(f"{mask_key(key)}: {_error_text(resp)}")
+        if resp.status_code not in (401, 403, 429):
+            break  # 与 key 无关的错误（端点/路径/服务端故障），换下一把也一样
+    return {"ok": False, "error": "；".join(errors) or "拉取模型列表失败", "models": []}
 
 
 # ---------------------------------------------------------------------------
