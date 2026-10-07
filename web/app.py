@@ -590,6 +590,7 @@ _API_INDEX = {
         {"method": "POST", "path": "/api/llm/keys/reset", "desc": "重试失效 Key（清空失效/冷却标记）"},
         {"method": "POST", "path": "/api/llm/analyze", "desc": "工艺分析（一次性返回）"},
         {"method": "POST", "path": "/api/llm/analyze/stream", "desc": "工艺分析（SSE 流式）"},
+        {"method": "POST", "path": "/api/llm/conditions/stream", "desc": "候选反应条件枚举（SSE；先选条件再深入分析）"},
         {"method": "POST", "path": "/api/llm/followup/stream", "desc": "工艺分析追问（SSE，携带上下文自由回答）"},
     ],
 }
@@ -922,9 +923,12 @@ def api_load():
 #   🔴 与模型推理链路完全隔离：不经过 jobhub、不占主线程 pump、不 spawn 子进程，
 #      所以「大模型在分析」不会阻塞「单步预测」的轮询。
 # --------------------------------------------------------------------------
-def _llm_payload():
-    """从请求体里取出这一步反应上下文（前端已把树上的信息整理好）。"""
-    data = request.get_json(force=True, silent=True) or {}
+def _llm_common_payload(data: dict) -> dict:
+    """从请求体里取出这一步反应上下文（产物 / 前体 / 概率 / 模型 / 路线上下文 / 勾选模块）。
+
+    🔴 单独抽出来是为了让「深入分析」与「候选条件枚举」共用同一套解析 ——
+       两条链路的上下文必须完全一致，否则枚举出的条件与后面分析的条件对不上。
+    """
     precursors = data.get("precursors") or []
     if isinstance(precursors, str):
         precursors = [p for p in precursors.split(".") if p]
@@ -942,6 +946,60 @@ def _llm_payload():
         "continue_from": str(data.get("continue_from") or "").strip(),
         "modules": modules,
     }
+
+
+def _llm_payload():
+    """深入分析请求体：在公共上下文上补「用户选定的候选条件方案」。
+
+    🔴 chosen_condition 必须**白名单 + 截断**后转发：它是前端从枚举结果里原样带回的对象，
+       直接透传等于让请求体成为 prompt 的任意注入口（长度也不可控）。
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    req = _llm_common_payload(data)
+    chosen = data.get("chosen_condition")
+    chosen_out = None
+    if isinstance(chosen, dict) and chosen:
+        chosen_out = {}
+        for key in (
+            "id",
+            "name",
+            "strategy",
+            "solvent",
+            "temperature",
+            "time",
+            "atmosphere",
+            "catalyst",
+            "equiv",
+            "concentration",
+            "workup",
+            "risk",
+            "best_for",
+        ):
+            val = chosen.get(key)
+            if val is not None and str(val).strip():
+                chosen_out[key] = str(val).strip()[:400]
+        for key in ("pros", "cons"):
+            val = chosen.get(key)
+            if isinstance(val, list):
+                items = [str(x).strip()[:300] for x in val if str(x).strip()]
+                if items:
+                    chosen_out[key] = items[:8]
+        if not chosen_out:
+            chosen_out = None
+    req["chosen_condition"] = chosen_out
+    return req
+
+
+def _llm_conditions_payload():
+    """候选条件枚举请求体：公共上下文 + 想要几套方案（2~6，默认 4）。"""
+    data = request.get_json(force=True, silent=True) or {}
+    req = _llm_common_payload(data)
+    try:
+        count = int(data.get("count"))
+    except (TypeError, ValueError):
+        count = 4
+    req["count"] = max(2, min(6, count))
+    return req
 
 
 def _llm_followup_payload():
@@ -1068,6 +1126,32 @@ def api_llm_analyze_stream():
     }
     return Response(
         llm.stream_analyze(req),
+        mimetype="text/event-stream",
+        headers=headers,
+    )
+
+
+@app.route("/api/llm/conditions/stream", methods=["POST"])
+def api_llm_conditions_stream():
+    """候选反应条件枚举（SSE）：先列出「这一步可以怎么做」的多套条件，再由用户挑一套深入分析。
+
+    🔴 与 /api/llm/analyze/stream 的上下文**完全一致**（同一份 build_messages 正文），
+       差别只在 system 提示与输出结构 —— 这条只要「条件方案」数组，不要机理 / 后处理细节。
+       选定某套后，前端把它作为 `chosen_condition` 回传给 analyze/stream ⇒ 深入分析会锁定它。
+    """
+    if llm is None:
+        return jsonify({"ok": False, "error": "后端未启用大模型模块"}), 500
+    req = _llm_conditions_payload()
+    if not req["product"] and not req["precursors"]:
+        return jsonify({"ok": False, "error": "缺少产物或前体信息"}), 400
+
+    headers = {
+        "Cache-Control": "no-cache, no-transform",
+        "X-Accel-Buffering": "no",
+        "Connection": "keep-alive",
+    }
+    return Response(
+        llm.stream_conditions(req),
         mimetype="text/event-stream",
         headers=headers,
     )

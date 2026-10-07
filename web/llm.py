@@ -751,7 +751,7 @@ _MODULE_FIELDS = {
     "summary": {"fields": ["summary", "reaction_type"], "desc": "总述与反应类型"},
     "mechanism": {"fields": ["mechanism"], "desc": "逐步电子转移机理（type/steps/intermediates/rate_determining/selectivity/evidence）"},
     "order": {"fields": ["order"], "desc": "投料顺序（seq/mode/reagent/equiv/note）"},
-    "conditions": {"fields": ["conditions"], "desc": "反应条件（溶剂/温度/时间/气氛/催化剂/后处理概览）"},
+    "conditions": {"fields": ["conditions"], "desc": "反应条件（溶剂/温度/时间/气氛/催化剂/后处理概览；已选定候选方案时沿用该方案）"},
     "workup": {"fields": ["workup"], "desc": "后处理分析（淬灭/萃取分液/洗涤/干燥/浓缩/纯化/回收率/放大注意点）"},
     "outcome": {"fields": ["outcome"], "desc": "预期结果与收率（转化/收率/纯度/风险）"},
     "byproducts": {"fields": ["byproducts"], "desc": "可能的副产物（名称/来源机理/mz/控制方式）"},
@@ -764,17 +764,19 @@ _MODULE_FIELDS = {
 # 其余是可选项。confidence 始终保留（帮助判断整体把握）。
 
 
-def _build_system(modules: list[str] | None) -> str:
+def _build_system(modules: list[str] | None, extra_note: str = "") -> str:
     """按勾选模块生成 system 提示：只要求输出勾选的字段。
 
     modules 为空 / None = 全量（走默认 _SYSTEM）。
+    extra_note: 额外约束（如「条件已由用户选定，必须沿用」），追加在最后。
     """
+    tail = ("\n\n" + extra_note) if extra_note else ""
     if not modules:
-        return _SYSTEM
+        return _SYSTEM + tail
     # 去重 + 过滤未知 key + 保持 _MODULE_FIELDS 的固定顺序
     wanted = [m for m in _MODULE_FIELDS if m in set(modules)]
     if not wanted:  # 全被过滤了，退化为全量
-        return _SYSTEM
+        return _SYSTEM + tail
     # summary 永远带上（基础信息）
     if "summary" not in wanted:
         wanted = ["summary", *wanted]
@@ -792,7 +794,7 @@ def _build_system(modules: list[str] | None) -> str:
         "本次只需分析用户勾选的这几个方面，输出一个 JSON 对象，**只包含以下字段**："
         f"{field_json}。不要输出其它任何字段；未勾选的方面（如未要求 NMR 就不要给 nmr 字段）。"
     )
-    return _SYSTEM + "\n\n" + extra
+    return _SYSTEM + "\n\n" + extra + tail
 
 
 def _fmt_mass_row(r: dict) -> str:
@@ -804,12 +806,47 @@ def _fmt_mass_row(r: dict) -> str:
     )
 
 
+# 候选条件方案里要在 prompt 中回述的字段（顺序即展示顺序）。
+# 🔴 用户挑了一套条件后，深入分析必须**锁定**它 —— 把整套条件原样回述给模型，
+#    否则模型会「自作主张」再换一个溶剂/温度，等于用户的选择白做了。
+CONDITION_FIELD_LABELS = (
+    ("name", "方案名"),
+    ("strategy", "设计取向"),
+    ("solvent", "溶剂体系"),
+    ("temperature", "温度程序"),
+    ("time", "反应时间"),
+    ("atmosphere", "气氛"),
+    ("catalyst", "催化剂 / 碱 / 缩合剂"),
+    ("equiv", "当量"),
+    ("concentration", "反应浓度"),
+    ("workup", "后处理概览"),
+    ("risk", "已知风险"),
+    ("best_for", "适用场景"),
+)
+
+
+def _fmt_chosen_condition(chosen: dict) -> list[str]:
+    """把选定的候选条件渲染成 prompt 里的几行（只列有值的字段）。"""
+    lines = ["## 已选定的反应条件（用户从候选方案里挑的，本次分析必须锁定这套条件）"]
+    for key, label in CONDITION_FIELD_LABELS:
+        val = str(chosen.get(key) or "").strip()
+        if val:
+            lines.append(f"- {label}：{val}")
+    for key, label in (("pros", "优点"), ("cons", "代价")):
+        items = [str(x).strip() for x in (chosen.get(key) or []) if str(x).strip()]
+        if items:
+            lines.append(f"- {label}：" + "；".join(items))
+    return lines
+
+
 def build_messages(req: dict, masses: dict, json_footer: bool = True) -> list:
     """把一步反应上下文拼成对话 prompt。
 
-    req: {product, precursors:[...], probability, model, context?, modules?}
+    req: {product, precursors:[...], probability, model, context?, modules?, chosen_condition?}
     modules: 前端勾选的分析模块（['mechanism','order','lcms',...]），
              为空/缺省 = 全量分析。仅要求模型输出勾选字段。
+    chosen_condition: 用户选定的候选条件方案（dict）。给了就把整套条件写进上下文，
+             并要求 `conditions` 字段沿用这套条件，不许另换。
     json_footer: 末尾那句「请按 JSON 结构输出」是否要带上。
              **追问**场景复用的就是这段上下文，但它要的是自由文本回答 ⇒ 传 False，
              否则模型会照着 JSON 骨架答非所问。
@@ -820,6 +857,9 @@ def build_messages(req: dict, masses: dict, json_footer: bool = True) -> list:
     model_name = req.get("model") or ""
     ctx = req.get("context") or {}
     modules = req.get("modules")
+    chosen = req.get("chosen_condition")
+    if not isinstance(chosen, dict) or not chosen:
+        chosen = None
 
     by = masses.get("by_smiles") or {}
     lines = []
@@ -852,6 +892,10 @@ def build_messages(req: dict, masses: dict, json_footer: bool = True) -> list:
             for s in ctx["prior_steps"]:
                 lines.append(f"  - {s}")
 
+    if chosen:
+        lines.append("")
+        lines.extend(_fmt_chosen_condition(chosen))
+
     # 把确定性的质量表一起喂进去，让模型在此基础上解释，而不是自己瞎算
     rows = [r for r in (masses.get("rows") or [])]
     if rows:
@@ -862,10 +906,26 @@ def build_messages(req: dict, masses: dict, json_footer: bool = True) -> list:
 
     lines.append("")
     if json_footer:
-        lines.append("请按系统提示里的 JSON 结构输出这一步的工艺分析（含 mechanism：逐步电子转移机理）。")
+        if chosen:
+            lines.append(
+                "请按系统提示里的 JSON 结构输出这一步的工艺分析（含 mechanism：逐步电子转移机理）。"
+                "**注意：反应条件已由用户在候选方案中选定（见上）** —— `conditions` 字段必须沿用这套条件，"
+                "不要另换溶剂 / 温度 / 试剂体系；投料顺序、后处理、机理都要与它自洽。"
+                "如果你认为这套条件有问题，仍按它写，把问题写进 `outcome.risk` 与 `safety`。"
+            )
+        else:
+            lines.append("请按系统提示里的 JSON 结构输出这一步的工艺分析（含 mechanism：逐步电子转移机理）。")
+
+    system_note = ""
+    if chosen:
+        system_note = (
+            "用户已从候选条件方案里选定了一套条件（见用户消息里的「已选定的反应条件」）。"
+            "`conditions` 字段必须原样沿用它的溶剂 / 温度 / 试剂体系与当量，不要另起一套；"
+            "你的任务是把它展开成可执行的细节，而不是重新选条件。"
+        )
 
     return [
-        {"role": "system", "content": _build_system(modules)},
+        {"role": "system", "content": _build_system(modules, system_note)},
         {"role": "user", "content": "\n".join(lines)},
     ]
 
@@ -1194,6 +1254,286 @@ def stream_analyze(req: dict) -> Iterator[str]:
     except Exception as e:  # noqa: BLE001
         # 瞬时网络故障（TLS 被掐 / 代理端口失效 / 读半截）翻成人话，别甩一个
         # SSLEOFError 让用户猜 —— 实测这类错误重发就好，指引里直接给开关。
+        if _is_transient(e):
+            yield sse({"type": "error", "error": network_error_text(e, tried, cfg["base_url"])})
+        else:
+            yield sse({"type": "error", "error": f"{type(e).__name__}: {e}"})
+
+
+# ---------------------------------------------------------------------------
+# 候选反应条件枚举 —— 先列出「这一步可以怎么做」的几套条件，再由用户挑一套深入
+# ---------------------------------------------------------------------------
+# 🔴 为什么要单独一步：反应条件（溶剂 / 温度 / 碱与缩合试剂 / 浓度 / 投料方式）本来就是
+#    一个组合空间，一次只给一套 ⇒ 等于把模型的第一直觉当成唯一答案，使用者看不到别的做法。
+#    先枚举、再选定，才能比较取舍；选定后深入分析会**锁定**这套条件（build_messages 的
+#    `chosen_condition`），不会又换一套。
+CONDITIONS_SYSTEM = """你是一位有 20 年经验的过程化学家 / 工艺开发研究员（Process Chemist），
+精通逆合成路线评估、反应条件筛选（溶剂 / 温度 / 碱与缩合剂 / 浓度 / 投料方式）与放大风险判断。
+
+你的任务：看到「目标产物 + 一组前体」这一步反应，**只做一件事** ——
+给出这一步反应在实验室与工业实践里**真实可选的多套反应条件方案**，供使用者挑一套再深入分析。
+不要输出投料顺序细节、不要写机理、不要给 NMR 归属 —— 那些是选定条件之后的下一步工作。
+
+硬性要求：
+1. 只输出**一个 JSON 对象**，不要任何解释性文字、不要 markdown 代码围栏。
+2. 各套方案必须是**真正不同的路线**，不能是同一套换个说法：在「溶剂体系 / 温度程序 /
+   碱与催化剂 / 偶联或缩合试剂 / 浓度 / 投料方式」里**至少有两项实质差别**，
+   并且分别代表一种设计取向（例如 温和低副反应 / 高转化率 / 低成本易放大 /
+   绿色低毒 / 无水苛刻条件 / 一锅法简化后处理）。
+3. 共给 {count} 套，`id` 依次为 A、B、C…；每套都要给 `pros` / `cons` / `risk` / `best_for`，
+   让使用者能据此**比较取舍**（不要每套都说"很好"）。
+4. 条件要落到能开工的粒度：溶剂给体系与体积数（V）、温度给程序、时间给小时、
+   关键试剂给当量与相对基准、浓度给 mol/L；把握不足就写"不确定"或给范围，**禁止编造文献与收率**。
+5. 化学上不可行、或与前体不匹配的方案不要给。若这一步反应本身可疑（价态 / 机理不合理），
+   在 `note` 里直接说清楚。
+6. `recommendation` 必须带**前提**（"若首要目标是 X，选 A；若要放大，选 C"），不要无条件推荐一套。
+7. `key_variable` 要说清这一步为什么会有多套条件 —— 哪个变量最关键（1~2 句）。
+8. `note` 必须保留这句提示的原意：这些条件为模型推断、未经实验验证，实验前必须由专业人员复核。
+
+JSON 结构（字段必须齐全，值可以为空字符串或空数组）：
+{
+  "reaction_type": "反应类型，如 酰胺缩合 / 酯化 / Suzuki 偶联",
+  "key_variable": "这一步为什么会有多套条件：最关键的变量是什么（1~2 句）",
+  "options": [
+    {
+      "id": "A",
+      "name": "简短方案名，如 低温慢加 · DCM 体系",
+      "strategy": "设计取向，如 温和优先 / 高产率优先 / 低成本易放大 / 绿色低毒",
+      "solvent": "溶剂体系与体积（如 DCM，5 V）",
+      "temperature": "温度程序（如 -10 °C 滴加，室温 2 h）",
+      "time": "总反应时间（如 3 h）",
+      "atmosphere": "气氛（如 N2 / 空气）",
+      "catalyst": "催化剂 / 碱 / 缩合剂 / 配体及当量（无则写 无）",
+      "equiv": "关键试剂当量与相对基准（如 酸 1.05 eq（相对胺））",
+      "concentration": "反应浓度（如 0.2 M）",
+      "workup": "后处理一句话概览（与其余方案要有区别）",
+      "pros": ["相对其它方案的优点"],
+      "cons": ["代价 / 缺点"],
+      "risk": "这套方案最可能出的问题与放大风险",
+      "best_for": "什么情况下该选它",
+      "confidence": 0.0
+    }
+  ],
+  "recommendation": "在什么前提下推荐哪一套、为什么",
+  "note": "以上条件为模型基于反应类型的推断，未经实验验证；实验前必须由专业人员复核"
+}
+"""
+
+# 模型偶尔漏 id（或给成 1/2/3），这里按位置补成 A/B/C…
+_CONDITION_ID_LETTERS = "ABCDEFGH"
+_CONDITION_KEEP = (
+    "id",
+    "name",
+    "strategy",
+    "solvent",
+    "temperature",
+    "time",
+    "atmosphere",
+    "catalyst",
+    "equiv",
+    "concentration",
+    "workup",
+    "risk",
+    "best_for",
+)
+
+
+def _norm_conditions(data: Optional[dict], count: int) -> Optional[dict]:
+    """归一化模型输出的候选条件方案。
+
+    🔴 为什么必须归一化：前端直接把这些字段渲染成卡片，模型漏字段 / 把 `pros` 写成
+       一整段字符串都是常见输出（实测），不兜底就会出现整块空白或 "undefined"。
+       这里统一成「字符串字段一定是 str、pros/cons 一定是字符串数组、id 一定存在且唯一」。
+    """
+    if not isinstance(data, dict):
+        return None
+    raw = data.get("options")
+    if not isinstance(raw, list):
+        return None
+
+    def _text(obj: dict, key: str) -> str:
+        val = obj.get(key)
+        if val is None or isinstance(val, (dict, list)):
+            return ""
+        return str(val).strip()
+
+    def _list(obj: dict, key: str) -> list[str]:
+        val = obj.get(key)
+        if isinstance(val, list):
+            return [str(x).strip() for x in val if not isinstance(x, (dict, list)) and str(x).strip()]
+        if isinstance(val, str):
+            # 「温和；不需严格无水」这类挤成一行的写法按分隔符拆开
+            return [part.strip() for part in re.split(r"[；;\n]+", val) if part.strip()]
+        return []
+
+    options: list[dict] = []
+    seen: set[str] = set()
+    # 🔴 必须先过滤非对象、再按 count 截断：反过来的话，模型混进来的一条字符串
+    #    （实测会出现在 options 里）会白吃掉一个方案配额 ⇒ 用户要 4 套只拿到 3 套。
+    items = [x for x in raw if isinstance(x, dict)]
+    for i, item in enumerate(items[: max(1, count)]):
+        out: dict = {}
+        for key in _CONDITION_KEEP:
+            out[key] = _text(item, key)
+        # 空名 / 缺 id 都要兜住：id 是前端「选定方案」的键，不能缺也不能重
+        if not out["id"] or out["id"] in seen:
+            out["id"] = _CONDITION_ID_LETTERS[len(options) % len(_CONDITION_ID_LETTERS)]
+        seen.add(out["id"])
+        if not out["name"]:
+            out["name"] = f"方案 {out['id']}"
+        out["pros"] = _list(item, "pros")
+        out["cons"] = _list(item, "cons")
+        try:
+            conf = item.get("confidence")
+            out["confidence"] = round(max(0.0, min(1.0, float(conf))), 2) if conf is not None else None
+        except (TypeError, ValueError):
+            out["confidence"] = None
+        options.append(out)
+
+    if not options:
+        return None
+    data["options"] = options
+    for key in ("reaction_type", "key_variable", "recommendation", "note"):
+        data[key] = _text(data, key)
+    # 「未经实验验证」这句是安全底线，模型漏了就补上（前端直接展示 note）
+    if not data.get("note"):
+        data["note"] = "以上条件为模型基于反应类型的推断，未经实验验证；实验前必须由专业人员复核。"
+    return data
+
+
+def build_conditions_messages(req: dict, masses: dict, count: int = 4) -> list:
+    """把「枚举这一步的候选反应条件」拼成对话 prompt。
+
+    🔴 上下文与深入分析**同一份**（复用 build_messages 的正文，json_footer=False，且显式
+       把 chosen_condition 置空）—— 否则枚举时会看到上一次选定的条件，被带偏成"再给一套类似的"。
+    """
+    ctx_text = build_messages(
+        {**req, "modules": None, "chosen_condition": None}, masses, json_footer=False
+    )[-1]["content"]
+    system = CONDITIONS_SYSTEM.replace("{count}", str(count))
+    user = (
+        f"以下是这一步反应的背景资料。请先读完，然后给出 {count} 套可行的反应条件方案供选择。\n\n"
+        + ctx_text
+    )
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+
+
+def stream_conditions(req: dict) -> Iterator[str]:
+    """候选反应条件枚举（SSE 流式：思考 / 正文增量照常转发，结束时下发抽好的 JSON）。
+
+    事件序列与 stream_analyze **完全一致**（前端复用同一套解析）：
+        meta → {model, computed}
+        thinking → {text} / thinking_end → {chars}
+        delta → {text}
+        done → {data, computed, raw, model, reasoning, finish_reason}
+        error → {error}
+    """
+    def sse(obj: dict) -> str:
+        return "data: " + json.dumps(obj, ensure_ascii=False) + "\n\n"
+
+    cfg = config()
+    tried: list[str] = []
+    try:
+        if not is_configured():
+            yield sse({"type": "error", "error": public_status()["hint"] or "大模型未配置"})
+            return
+        count = req.get("count")
+        try:
+            count = max(2, min(6, int(count)))
+        except (TypeError, ValueError):
+            count = 4
+
+        masses = mass_info([req.get("product") or ""] + list(req.get("precursors") or []))
+        yield sse({"type": "meta", "model": cfg["model"], "computed": masses})
+
+        messages = build_conditions_messages(req, masses, count)
+        collected: list[str] = []
+        think_buf: list[str] = []
+        think_sent = 0
+        finish_reason = ""
+
+        try:
+            resp, _key_idx = request_chat(
+                cfg,
+                json_body=_body(cfg, messages, stream=True),
+                stream=True,
+                timeout=cfg["timeout"],
+                tried=tried,
+            )
+        except MultiKeyError as e:
+            yield sse({"type": "error", "error": str(e)})
+            return
+        with resp:
+            if resp.status_code >= 400:
+                yield sse({"type": "error", "error": _error_text(resp)})
+                return
+            for raw_line in resp.iter_lines(decode_unicode=False):
+                if not raw_line:
+                    continue
+                try:
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                except Exception:  # noqa: BLE001
+                    continue
+                if not line.startswith("data:"):
+                    continue
+                chunk_str = line[5:].strip()
+                if not chunk_str or chunk_str == "[DONE]":
+                    continue
+                try:
+                    chunk = json.loads(chunk_str)
+                except Exception:  # noqa: BLE001
+                    continue
+                try:
+                    fr = ((chunk.get("choices") or [{}])[0] or {}).get("finish_reason") or ""
+                    if fr:
+                        finish_reason = str(fr)
+                except Exception:  # noqa: BLE001
+                    pass
+                think = _think_of(chunk)
+                if think:
+                    think_buf.append(think)
+                    yield sse({"type": "thinking", "text": think})
+                text = _delta_of(chunk)
+                if text:
+                    if think_sent == 0 and think_buf:
+                        think_sent = 1
+                        yield sse({"type": "thinking_end", "chars": len("".join(think_buf))})
+                    collected.append(text)
+                    yield sse({"type": "delta", "text": text})
+
+        raw = "".join(collected)
+        data = _norm_conditions(extract_json(raw), count)
+        # 🔴 枚举失败必须响亮报错：前端要靠 options 渲染卡片，静默 empty 会显示成"没有可选条件"
+        if finish_reason == "length" and not data:
+            yield sse(
+                {
+                    "type": "error",
+                    "error": (
+                        f"枚举被截断（finish_reason=length，已收到 {len(raw)} 字符正文）："
+                        f"多方案输出较长，请调大输出上限（当前 {cfg.get('max_tokens')}）"
+                        f"或减少方案数。"
+                    ),
+                }
+            )
+            return
+        if not data:
+            yield sse({"type": "error", "error": "未能解析出候选条件方案，请重试（或减少方案数）"})
+            return
+        yield sse(
+            {
+                "type": "done",
+                "data": data,
+                "computed": masses,
+                "raw": raw,
+                "model": cfg["model"],
+                "reasoning": "".join(think_buf),
+                "finish_reason": finish_reason,
+            }
+        )
+    except Exception as e:  # noqa: BLE001
         if _is_transient(e):
             yield sse({"type": "error", "error": network_error_text(e, tried, cfg["base_url"])})
         else:
