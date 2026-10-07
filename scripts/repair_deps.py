@@ -1,12 +1,26 @@
 # -*- coding: utf-8 -*-
-"""一体化修复+测试 v2：以导入探测为准，坏哪个修哪个，循环直至通过，最后跑推理测试。"""
+"""环境自检 + 自修复：以「逐个导入探测」为准，坏哪个重装哪个，循环到通过，最后跑推理冒烟测试。
+
+用法（在仓库根执行）:
+    python scripts/repair_deps.py
+
+流程:
+    1. 逐个 import 推理必需的模块，收集失败的
+    2. 失败项按同名版本 `pip install --force-reinstall --no-deps` 重装（torch 走 cu121 源）
+    3. 最多 6 轮，直到全部通过
+    4. 通过后以子进程方式跑 scripts/check_install.py 做真实推理验证
+
+🔴 这里**故意不导入 bootstrap.envfix** —— 自检要暴露环境的真实状态，
+   而不是先替它把 DLL 路径补好。
+"""
 import importlib
-import json
 import os
 import subprocess
 import sys
 
 PY = sys.executable
+
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # 推理必需的模块 -> pip 包名映射
 MODULES = {
@@ -49,7 +63,7 @@ def probe_imports():
     for mod in MODULES:
         try:
             importlib.import_module(mod)
-        except BaseException as e:  # noqa: BLE001
+        except BaseException:  # noqa: BLE001
             failed.append(mod)
     return failed
 
@@ -91,13 +105,10 @@ def main():
     print("所有关键模块导入通过!\n")
 
     print("=== 开始推理测试 ===")
-    os.chdir(r"F:\retrochimera")
+    os.chdir(_ROOT)
     # 用子进程独立运行测试脚本，避免模型内部 multiprocessing 与 exec 冲突
-    r = subprocess.run(
-        [PY, r"F:\retrochimera\test_install.py",
-         r"F:\retrochimera\models\retrochimera_pistachio", "3"],
-        cwd=r"F:\retrochimera",
-    )
+    smoke = os.path.join(_ROOT, "scripts", "check_install.py")
+    r = subprocess.run([PY, smoke, "3"], cwd=_ROOT)
     return r.returncode
 
 

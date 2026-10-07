@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """RetroChimera 本地网页版 —— 逆合成预测 + 完整合成路径搜索
 
-启动:
-    python F:\\retrochimera\\web\\app.py
-    或双击 启动网页版.bat
+启动（在仓库根执行，用相对路径 —— 换盘符 / 换目录都不用改）:
+    python web/app.py
+    或双击仓库根目录的 启动后端API.bat
 
-浏览器打开 http://127.0.0.1:8000
+浏览器打开 http://127.0.0.1:8000   ← 只返回端点清单 JSON，不托管前端页面
 """
 import os
 import re
@@ -44,17 +44,27 @@ import concurrent.futures
 from flask import Flask, Response, jsonify, request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+_PARENT = os.path.dirname(HERE)  # 仓库根
+
+# --- 上游源码（core/）挂载兜底 ---------------------------------------------
+# retrochimera 源码随本仓一起分发在 <仓库根>/core/。正常情况已装好
+# （`pip install -e core`，见 README 3.2）；这里再兜一层，避免换机器时
+# 忘记装却只报一句 "ModuleNotFoundError" 看不出缘由。
+# 放在 sys.path **末尾** —— 优先级低于任何已安装版本，不会覆盖显式安装。
+_CORE_DIR = os.path.join(_PARENT, "core")
+if os.path.isdir(_CORE_DIR) and _CORE_DIR not in sys.path:
+    sys.path.append(_CORE_DIR)
 
 # --- 限制规则应用子进程数（必须在导入 retrochimera / syntheseus 之前） -------
-# RetroChimera 的 RuleApplicationServer 默认按 os.cpu_count()（本机 16）开子进程，
+# 实现见 bootstrap/limit_workers.py：把 syntheseus 的 cpu_count() 固定为 4
+# （可用环境变量 RETRO_RULE_WORKERS 覆盖）。
+# 不限制的话 RuleApplicationServer 按 os.cpu_count()（本机 16）开子进程，
 # 每个子进程加载完整规则库约 4.4 GB → 合计约 70 GB，会把页面文件打满并报
-# "WinError 1455 页面文件太小，无法完成操作"。限制为 4 个即可（可用环境变量
-# RETRO_RULE_WORKERS 覆盖）。
+# "WinError 1455 页面文件太小，无法完成操作"。
 try:
-    _parent = os.path.dirname(HERE)
-    if _parent not in sys.path:
-        sys.path.insert(0, _parent)
-    import _limit_workers  # noqa: F401
+    if _PARENT not in sys.path:
+        sys.path.insert(0, _PARENT)
+    from bootstrap import limit_workers  # noqa: F401
 except Exception as _e:  # noqa: BLE001
     print(f"[app] 注意：未能限制规则子进程数（{_e}）")
 

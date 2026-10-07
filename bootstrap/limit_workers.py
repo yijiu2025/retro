@@ -1,4 +1,4 @@
-"""限制 RetroChimera 规则应用服务的子进程数量 —— 解决 WinError 1455「页面文件太小」。
+r"""限制 RetroChimera 规则应用服务的子进程数量 —— 解决 WinError 1455「页面文件太小」。
 
 问题
 ----
@@ -22,7 +22,9 @@
 ----
 在任何会触发 `RuleApplicationServer` 的脚本**最顶部**（早于 retrochimera 导入）：
 
-    import _limit_workers  # noqa: F401
+    from bootstrap import limit_workers  # noqa: F401
+
+脚本位于子目录时，先按 bootstrap/__init__.py 的说明把仓库根补进 sys.path。
 
 可用环境变量覆盖进程数：
     set RETRO_RULE_WORKERS=4
@@ -63,10 +65,10 @@ def _patch_cpu_count() -> None:
         except Exception:
             pass
 
-        print(f"[_limit_workers] cpu_count 已限制为 {_WORKERS}（原值 {_orig()}），"
+        print(f"[bootstrap.limit_workers] cpu_count 已限制为 {_WORKERS}（原值 {_orig()}），"
               f"预计规则子进程内存约 {_WORKERS * 4.4:.0f} GB")
     except Exception as e:  # noqa: BLE001
-        print(f"[_limit_workers] 打补丁失败（将使用默认值）: {e}")
+        print(f"[bootstrap.limit_workers] 打补丁失败（将使用默认值）: {e}")
 
 
 _patch_cpu_count()

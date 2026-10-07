@@ -13,25 +13,40 @@
 
 ```
 retrochimera/
-├── web/                   ← 本项目主体（我们自己的 API 层）
-│   ├── app.py              Flask 应用 + 全部 API 路由
-│   ├── llm.py              大模型调用 + SSE 流式分析
-│   ├── jobhub.py           任务队列（长任务不阻塞请求）
-│   ├── .env.example        配置模板（复制成 .env 再填）
-│   ├── requirements.txt    依赖清单（除上游本体）
-│   └── 启动后端API.bat      Windows 一键启动
-├── upstream/              ← 上游源码（**已 vendored 进本仓**，见其 VENDORED.md）
-│   ├── retrochimera/        上游 Python 包本体
-│   └── pyproject.toml       装它：cd upstream && pip install -e .
-└── models/                ← 模型权重，9GB，**不入库**
+├── 启动后端API.bat         ← Windows 一键启动（双击即用）
+├── run_api.py             ← 命令行启动器（清掉干扰 sys.path 的注入路径）
+├── web/                    ← API 服务主体（Flask，只出接口、不托管页面）
+│   ├── app.py                Flask 应用 + 全部 API 路由
+│   ├── llm.py                大模型调用 + SSE 流式分析
+│   ├── jobhub.py             任务队列（长任务不阻塞请求）
+│   ├── .env.example          配置模板（复制成 .env 再填）
+│   └── requirements.txt      依赖清单（除上游本体）
+├── bootstrap/              ← 运行时引导垫片（**必须在第三方 import 之前导入**）
+│   ├── envfix.py             补 conda 的 DLL 搜索路径（修 `_ssl` 加载失败）
+│   └── limit_workers.py      限制规则子进程数（修 WinError 1455）
+├── scripts/                ← 命令行工具（诊断 / 预测 / 搜索 / 自修复）
+│   ├── check_install.py      安装验证：加载模型跑一次真实预测
+│   ├── predict.py            单步预测 CLI（置信度分级 + 出反应结构图）
+│   ├── search.py             多步合成路线搜索 CLI
+│   └── repair_deps.py        依赖自检自修（坏哪个重装哪个）
+├── deploy/                 ← 部署物料
+│   ├── environment-win.yml   conda 环境导出文件
+│   └── wheels/               离线 Flask 依赖 wheel（断网时 .bat 靠它装）
+├── core/                   ← 上游源码（**已 vendored 进本仓**，见其 VENDORED.md）
+│   ├── retrochimera/         上游 Python 包本体
+│   └── pyproject.toml        装它：cd core && pip install -e .
+└── models/                 ← 模型权重，9GB，**不入库**
     ├── retrochimera_pistachio/
     └── retrochimera_uspto50k/
 ```
 
-**上游源码不需要再单独 clone** —— 它已纳入本仓版本管理（`upstream/`，约 1.6MB）。
-装完依赖后 `cd upstream && pip install -e .` 即可。
+**上游源码不需要再单独 clone** —— 它已纳入本仓版本管理（`core/`，约 1.1MB）。
+装完依赖后 `cd core && pip install -e .` 即可。
 
 只有 `models/` 是仓库外的东西（9GB 太大），换机器时手动拷过去（见第 3.3 节）。
+
+**全仓不写死盘符** —— 所有路径都按「仓库自身位置」推导，`git clone` 到哪个盘、哪个目录都能跑。
+模型位置可用环境变量覆盖，见第 3.3 / 5 节。
 
 ---
 
@@ -65,10 +80,10 @@ pip install torch==2.2.2 torchvision==0.17.2 --index-url https://download.pytorc
 
 > 没 GPU 就把 `cu121` 换成 `cpu`。
 
-再装其余依赖：
+再装其余依赖（在**仓库根**执行；下面用 `<仓库根>` 代指，例如 `F:\retrochimera`）：
 
 ```bat
-cd F:\retrochimera
+cd <仓库根>
 pip install -r web\requirements.txt
 ```
 
@@ -79,7 +94,7 @@ pip install -r web\requirements.txt
 ### 3.2 装上游本体（源码已在本仓，无需 clone）
 
 ```bat
-cd F:\retrochimera\upstream
+cd <仓库根>\core
 pip install -e .
 ```
 
@@ -95,8 +110,8 @@ pip install -e . --no-build-isolation
 python -c "import retrochimera; print(retrochimera.__file__)"
 ```
 
-路径应落在 `F:\retrochimera\upstream\retrochimera\__init__.py`。
-上游源码的版本信息与更新方式见 `upstream/VENDORED.md`。
+路径应落在 `<仓库根>\core\retrochimera\__init__.py`。
+上游源码的版本信息与更新方式见 `core/VENDORED.md`。
 
 ### 3.3 放模型权重
 
@@ -139,7 +154,7 @@ RETRO_LLM_MODEL=glm-5.2
 ### 方式一：双击（推荐）
 
 ```
-web\启动后端API.bat
+<仓库根>\启动后端API.bat
 ```
 
 它会自动找 Python（顺序：`RETRO_PYTHON` 环境变量 → 当前 conda 环境 → `.venv` →
@@ -155,15 +170,15 @@ set RETRO_PYTHON=D:\conda\envs\retrochimera\python.exe
 
 ```bat
 conda activate retrochimera
-cd F:\retrochimera
+cd <仓库根>
 python web\app.py
 ```
 
-或者用会话内启动器（会自动清掉干扰 `sys.path` 的注入路径）：
+或者用命令行启动器（会自动清掉干扰 `sys.path` 的注入路径）：
 
 ```bat
-python web\_run_web.py
-set RETRO_PORT=8011 && python web\_run_web.py
+python run_api.py
+set RETRO_PORT=8011 && python run_api.py
 ```
 
 启动后监听 **http://127.0.0.1:8000**。浏览器打开它只会看到 JSON 端点清单
@@ -176,9 +191,18 @@ npm install && npm run dev        # http://localhost:5177
 
 > 关窗口时刷出一堆红色 `BrokenPipeError` 是**正常的**（worker 清理），不影响结果。
 
-启动后监听 **http://127.0.0.1:8000**。
+### 附：随仓库附带的命令行工具
 
-> 关窗口时刷出一堆红色 `BrokenPipeError` 是**正常的**（worker 清理），不影响结果。
+都在 `scripts/` 下，在仓库根执行。它们**不需要**先启动 API 服务，直接加载模型跑。
+
+| 工具 | 用途 | 示例 |
+| --- | --- | --- |
+| `scripts/check_install.py` | 安装验证：加载模型跑一次真实预测 | `python scripts/check_install.py` |
+| `scripts/predict.py` | 单步预测，带置信度分级并生成反应结构图 | `python scripts/predict.py "CC(=O)Oc1ccccc1C(=O)O" 5` |
+| `scripts/search.py` | 多步合成路线搜索（Retro*），可输出 JSON | `python scripts/search.py "Oc1ccc(OCc2ccccc2)c(Br)c1" 80 150 3` |
+| `scripts/repair_deps.py` | 依赖自检自修：逐个探测导入，坏哪个重装哪个 | `python scripts/repair_deps.py` |
+
+`predict.py` 生成的结构图写在 `<仓库根>/outputs/`（该目录不入库）。
 
 ---
 
@@ -190,9 +214,10 @@ npm install && npm run dev        # http://localhost:5177
 | --- | --- | --- |
 | `RETRO_PORT` | `8000` | 监听端口 |
 | `RETRO_RULE_WORKERS` | `4` | 规则应用进程数。16（全部核心）会吃 70GB 内存并崩（WinError 1455），别乱调高 |
-| `RETRO_MODELS_DIR` | `<root>/models` | 模型根目录 |
+| `RETRO_MODELS_DIR` | `<仓库根>/models` | 模型根目录 |
 | `RETRO_MODEL_PISTACHIO` | — | 单独指定 pistachio 模型路径 |
 | `RETRO_MODEL_USPTO50K` | — | 单独指定 uspto50k 模型路径 |
+| `RETRO_OUTPUT_DIR` | `<仓库根>/outputs` | `scripts/predict.py` 结构图的输出目录 |
 | `RETRO_CORS_ORIGINS` | 空（关闭） | 允许跨域的前端 origin，逗号分隔；`*` 表示全放行。**前后端不同源时必须配** |
 | `RETRO_LLM_BASE_URL` | — | OpenAI 兼容端点，如 `https://token.sensenova.cn/v1` |
 | `RETRO_LLM_API_KEY` | — | 密钥 |
@@ -291,12 +316,17 @@ RETRO_LLM_TIMEOUT=300
   通过 `_REQ_Q` / `_RESP_Q` 两个队列通信。改这块之前先想清楚。
 - **首次请求很慢**。模型冷启动要加载数 GB 权重，前端有"预热"按钮可以先把它叫醒。
 - **`RETRO_RULE_WORKERS` 调高会崩**，见第 5 节。
-- **`upstream/` 里的上游代码是本项目依赖的一部分**，删了服务起不来；
+- **`bootstrap/` 的导入顺序不能动**。`bootstrap.envfix`（DLL 搜索路径）与
+  `bootstrap.limit_workers`（子进程数补丁）都是**副作用式**的 —— import 即生效，
+  且**必须早于 torch / retrochimera / syntheseus**。把这几行注释掉或挪到后面，
+  等于直接卸载修复，症状分别是 `_ssl` 加载失败和 WinError 1455。
+  细节见 `bootstrap/__init__.py`。
+- **`core/` 里的上游代码是本项目依赖的一部分**，删了服务起不来；
   它是 vendored 的，重新从 git 拉本仓即可恢复（不需要联网去上游 clone）。
 
 ---
 
 ## 10. 许可
 
-`web/` 下的代码是本项目自己的；`upstream/` 下的 RetroChimera 源码版权归 Microsoft，
-按其仓库内的 `LICENSE` 使用（MIT，见 `upstream/LICENSE`）。
+`web/`、`bootstrap/`、`scripts/` 下的代码是本项目自己的；`core/` 下的 RetroChimera
+源码版权归 Microsoft，按其仓库内的 `LICENSE` 使用（MIT，见 `core/LICENSE`）。

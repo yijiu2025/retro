@@ -1,18 +1,31 @@
 # -*- coding: utf-8 -*-
 """多步逆合成搜索：用 RetroChimera + syntheseus Retro* 搜出完整合成路径。
 
-用法:
-    python search_test.py "目标SMILES" [最大模型调用次数] [时间限制秒] [最大深度]
+用法（在仓库根执行）:
+    python scripts/search.py "目标SMILES" [最大模型调用次数] [时间限制秒] [最大深度]
 
 示例:
-    python search_test.py "Oc1ccc(OCc2ccccc2)c(Br)c1" 80 150 3
+    python scripts/search.py "Oc1ccc(OCc2ccccc2)c(Br)c1" 80 150 3
+
+模型目录按「环境变量优先 → 仓库内 models/」推导，不写死盘符：
+    RETRO_MODELS_DIR          整个模型根目录
+    RETRO_MODEL_PISTACHIO     单独指定 pistachio 模型目录
 """
+import os
 import sys
 import time
 
-import _envfix  # noqa: F401  # 必须在 torch 之前导入
+# --- 仓库根入 sys.path，让 bootstrap/ 可导入（必须在第三方 import 之前） -----
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
 
-MODEL_DIR = r"F:\retrochimera\models\retrochimera_pistachio"
+from bootstrap import envfix  # noqa: F401, E402  # 必须在 torch 之前导入
+
+MODEL_DIR = os.environ.get("RETRO_MODEL_PISTACHIO") or os.path.join(
+    os.environ.get("RETRO_MODELS_DIR") or os.path.join(_ROOT, "models"),
+    "retrochimera_pistachio",
+)
 
 
 def build_inventory(max_heavy_atoms: int = 10):
@@ -81,10 +94,15 @@ def main() -> int:
     time_limit = float(sys.argv[3]) if len(sys.argv) > 3 else 150.0
     max_depth = int(sys.argv[4]) if len(sys.argv) > 4 else 3
 
+    if not os.path.isdir(MODEL_DIR):
+        print(f"[错误] 找不到模型目录: {MODEL_DIR}")
+        print("       用 RETRO_MODELS_DIR 或 RETRO_MODEL_PISTACHIO 指定（见本文件头部说明）")
+        return 2
+
     from retrochimera import RetroChimeraModel
     from syntheseus import Molecule
     from syntheseus.search.algorithms.best_first.retro_star import RetroStarSearch
-    from syntheseus.search.graph.and_or import AndOrGraph, AndNode, OrNode
+    from syntheseus.search.graph.and_or import AndNode, OrNode
     from syntheseus.search.node_evaluation.common import (
         ConstantNodeEvaluator,
         ReactionModelLogProbCost,

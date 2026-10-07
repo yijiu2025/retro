@@ -1,6 +1,8 @@
 @echo off
 chcp 65001 >nul
-title RetroChimera Web UI
+title RetroChimera API
+rem === 本文件位于仓库根目录，双击即用 ===
+rem 所有路径统一以 %~dp0（仓库根）为基准，换盘符 / 换目录都不用改。
 cd /d "%~dp0"
 
 set "LOGFILE=%~dp0_startup_log.txt"
@@ -17,8 +19,8 @@ if defined CONDA_PREFIX (
         goto GOT_PYTHON
     )
 )
-if exist "%~dp0..\.venv\Scripts\python.exe" (
-    set "ENV_PY=%~dp0..\.venv\Scripts\python.exe"
+if exist "%~dp0.venv\Scripts\python.exe" (
+    set "ENV_PY=%~dp0.venv\Scripts\python.exe"
     goto GOT_PYTHON
 )
 if exist "C:\ProgramData\miniconda3\envs\retrochimera\python.exe" (
@@ -53,7 +55,7 @@ if not defined RETRO_RULE_WORKERS set "RETRO_RULE_WORKERS=4"
 echo workers=%RETRO_RULE_WORKERS% >> "%LOGFILE%"
 
 echo ==================================================================
-echo   RetroChimera Web UI
+echo   RetroChimera API
 echo ==================================================================
 echo.
 
@@ -69,7 +71,7 @@ goto START
 :INSTALL_FLASK
 echo [warn] flask missing, installing >> "%LOGFILE%"
 echo       Installing Flask from local wheels ...
-"%ENV_PY%" -m pip install --no-index --find-links "%~dp0wheels" flask werkzeug blinker itsdangerous "importlib-metadata==8.5.0" -q >>"%LOGFILE%" 2>&1
+"%ENV_PY%" -m pip install --no-index --find-links "%~dp0deploy\wheels" flask werkzeug blinker itsdangerous "importlib-metadata==8.5.0" -q >>"%LOGFILE%" 2>&1
 if errorlevel 1 (
     echo       Local install failed, trying online ...
     "%ENV_PY%" -m pip install flask -q >>"%LOGFILE%" 2>&1
@@ -110,7 +112,7 @@ echo   Closing the server may print red "BrokenPipeError" lines.
 echo   That is NORMAL (worker cleanup) and does not affect results.
 echo.
 echo [start] launching app.py >> "%LOGFILE%"
-"%ENV_PY%" -u "%~dp0app.py" 2>>"%LOGFILE%"
+"%ENV_PY%" -u "%~dp0web\app.py" 2>>"%LOGFILE%"
 
 echo.
 echo [3/3] Server stopped.

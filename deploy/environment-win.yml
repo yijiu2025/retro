@@ -32,14 +32,15 @@ name: retrochimera
 
 # ---- 步骤 6：syntheseus 与 RetroChimera 本体 ----
 #   python -m pip install "syntheseus==0.8.0" "syntheseus-graphium==0.1.0"
-#   cd /d F:\retrochimera\repo
+#   cd /d F:\retrochimera\core
 #   python -m pip install -e .
 
-# ---- 步骤 7（可选）：网页版 ----
+# ---- 步骤 7：API 服务 ----
 #   python -m pip install flask
 
 # ---- 验证 ----
-#   python F:\retrochimera\test_install.py F:\retrochimera\models\retrochimera_pistachio 3
+#   cd /d F:\retrochimera
+#   python scripts\check_install.py models\retrochimera_pistachio 3
 
 # 实测环境信息（2026-09-22）：
 #   Python 3.9.7 | torch 2.2.2+cu121 | numpy 1.26.4 | torch-geometric 2.5.2

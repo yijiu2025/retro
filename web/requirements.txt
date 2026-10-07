@@ -58,14 +58,14 @@ pyyaml
 syntheseus==0.8.0
 syntheseus-graphium==0.1.0
 
-# 网页服务（web/wheels/ 里有 Flask 的离线 wheel，断网环境可用）
+# API 服务（deploy/wheels/ 里有 Flask 的离线 wheel，断网环境可用）
 flask
 requests
 
 # ============================================================
 # 【第 4 步】RetroChimera 本体 —— 源码已在本仓库，直接装
-#   cd ../upstream
+#   cd ../core
 #   pip install -e .
 #   （卡在 build 依赖上就加 --no-build-isolation）
-#   说明见 upstream/VENDORED.md
+#   说明见 core/VENDORED.md
 # ============================================================

@@ -123,7 +123,7 @@ def public_status() -> dict:
         "has_key": bool(c["api_key"]),
         "json_mode": c["json_mode"],
         "hint": "" if is_configured() else (
-            "请在 F:\\retrochimera\\web\\.env 里填 RETRO_LLM_BASE_URL / RETRO_LLM_API_KEY / RETRO_LLM_MODEL"
+            "请在 web/.env 里填 RETRO_LLM_BASE_URL / RETRO_LLM_API_KEY / RETRO_LLM_MODEL"
             "（改完立即生效，无需重启）。"
         ),
     }

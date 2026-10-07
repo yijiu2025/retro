@@ -13,7 +13,9 @@ description = "Frontier retrosynthesis prediction model"
 readme = "README.md"
 requires-python = ">=3.9"
 license = {file = "LICENSE"}
-dynamic = ["version"]
+# 上游用 setuptools_scm 从 git tag 推导版本；本仓是固定 v1.3.0 的源码副本
+# （见 VENDORED.md），没有对应 tag，故写死版本，避免装成 0.0.0。
+version = "1.3.0"
 dependencies = [
     "h5py",
     "joblib",
@@ -43,7 +45,8 @@ namespaces = false
 [tool.setuptools.package-data]
 "retrochimera" = ["py.typed"]
 
-[tool.setuptools_scm]
+# 注：上游原本用 [tool.setuptools_scm] 动态推导版本，已改为静态 version（见上），
+# 该配置段随之移除。
 
 [tool.black]
 line-length = 100

@@ -1,32 +1,46 @@
 # -*- coding: utf-8 -*-
-"""RetroChimera 逆合成预测 —— 美观输出脚本
+"""RetroChimera 逆合成预测 —— 单步预测 CLI（带置信度分级 + 生成反应结构图）
 
-用法:
-    python predict_gui.py "目标分子SMILES" [结果数] [模型名]
+用法（在仓库根执行）:
+    python scripts/predict.py "目标分子SMILES" [结果数] [模型名]
 
 示例:
-    python predict_gui.py "Oc1ccc(OCc2ccccc2)c(Br)c1"
-    python predict_gui.py "CC(=O)Oc1ccccc1C(=O)O" 5
-    python predict_gui.py "CC(=O)Oc1ccccc1C(=O)O" 5 uspto50k
+    python scripts/predict.py "Oc1ccc(OCc2ccccc2)c(Br)c1"
+    python scripts/predict.py "CC(=O)Oc1ccccc1C(=O)O" 5
+    python scripts/predict.py "CC(=O)Oc1ccccc1C(=O)O" 5 uspto50k
 
 输出:
     - 终端打印带编号、概率、原子数的结果表
-    - 在脚本同目录生成 prediction_1.png / prediction_2.png ... 分子结构图
+    - 在 <仓库根>/outputs/ 生成 prediction_1.png / prediction_2.png ... 反应结构图
+
+模型目录按「环境变量优先 → 仓库内 models/」推导，不写死盘符：
+    RETRO_MODELS_DIR          整个模型根目录
+    RETRO_MODEL_PISTACHIO     单独指定 pistachio 模型目录
+    RETRO_MODEL_USPTO50K      单独指定 uspto50k 模型目录
 """
 import os
 import sys
 import time
 
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+_MODELS_ROOT = os.environ.get("RETRO_MODELS_DIR") or os.path.join(_ROOT, "models")
+
 MODELS = {
-    "pistachio": r"F:\retrochimera\models\retrochimera_pistachio",
-    "uspto50k": r"F:\retrochimera\models\retrochimera_uspto50k",
+    "pistachio": os.environ.get("RETRO_MODEL_PISTACHIO")
+    or os.path.join(_MODELS_ROOT, "retrochimera_pistachio"),
+    "uspto50k": os.environ.get("RETRO_MODEL_USPTO50K")
+    or os.path.join(_MODELS_ROOT, "retrochimera_uspto50k"),
 }
+
+# 结构图输出目录：放仓库根的 outputs/（不入库），而不是脚本所在目录
+OUTDIR = os.environ.get("RETRO_OUTPUT_DIR") or os.path.join(_ROOT, "outputs")
 
 
 def draw_reaction(product_smiles: str, precursor_smiles: str, prob: float, idx: int, outdir: str):
     """把「前体 -> 产物」画成一张反应图。"""
     from rdkit import Chem
-    from rdkit.Chem import Draw, AllChem
+    from rdkit.Chem import AllChem, Draw
     from rdkit.Chem.Draw import rdMolDraw2D
 
     rxn_smiles = f"{precursor_smiles}>>{product_smiles}"
@@ -57,6 +71,11 @@ def main() -> int:
     model_key = sys.argv[3] if len(sys.argv) > 3 else "pistachio"
     model_dir = MODELS.get(model_key, model_key)
 
+    if not os.path.isdir(model_dir):
+        print(f"[错误] 找不到模型目录: {model_dir}")
+        print("       用 RETRO_MODELS_DIR 或 RETRO_MODEL_<KEY> 指定（见本文件头部说明）")
+        return 2
+
     from retrochimera import RetroChimeraModel
     from syntheseus import Molecule
 
@@ -76,7 +95,7 @@ def main() -> int:
     print(f"  推理完成 ({dt:.1f}s)")
     print("-" * 78)
 
-    outdir = os.path.dirname(os.path.abspath(__file__))
+    os.makedirs(OUTDIR, exist_ok=True)
     saved = []
     for i, p in enumerate(predictions[0], 1):
         prob = p.metadata["probability"]
@@ -93,7 +112,7 @@ def main() -> int:
         n_react = len(smi.split("."))
         print(f"      前体分子数: {n_react}")
         try:
-            path = draw_reaction(product, smi, prob, i, outdir)
+            path = draw_reaction(product, smi, prob, i, OUTDIR)
             if path:
                 saved.append(path)
         except Exception as e:  # noqa: BLE001

@@ -1,17 +1,42 @@
 # -*- coding: utf-8 -*-
 """RetroChimera 安装验证脚本：加载模型并对示例分子做逆合成预测。
 
-用法:
-    python test_install.py [模型目录] [返回结果数]
-    python test_install.py F:\\retrochimera\\models\\retrochimera_pistachio 3
+用法（在仓库根执行）:
+    python scripts/check_install.py [模型目录] [返回结果数]
+
+示例:
+    python scripts/check_install.py
+    python scripts/check_install.py <仓库根>\\models\\retrochimera_pistachio 3
+
+不传模型目录时按「环境变量优先 → 仓库内 models/」推导：
+    RETRO_MODELS_DIR          整个模型根目录
+    RETRO_MODEL_PISTACHIO     单独指定 pistachio 模型目录
 """
+import os
 import sys
 import time
 
+# 仓库根入 sys.path，让 bootstrap/ 可导入（envfix 必须在第三方 import 之前）
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
+from bootstrap import envfix  # noqa: F401, E402
+
+_DEFAULT_MODEL_DIR = os.environ.get("RETRO_MODEL_PISTACHIO") or os.path.join(
+    os.environ.get("RETRO_MODELS_DIR") or os.path.join(_ROOT, "models"),
+    "retrochimera_pistachio",
+)
+
 
 def main() -> int:
-    model_dir = sys.argv[1] if len(sys.argv) > 1 else r"F:\retrochimera\models\retrochimera_pistachio"
+    model_dir = sys.argv[1] if len(sys.argv) > 1 else _DEFAULT_MODEL_DIR
     num_results = int(sys.argv[2]) if len(sys.argv) > 2 else 3
+
+    if not os.path.isdir(model_dir):
+        print(f"[错误] 找不到模型目录: {model_dir}")
+        print("       9GB 权重不入库，换机需手动放置；或用 RETRO_MODELS_DIR 指定")
+        return 2
 
     print(f"[1/3] 加载模型: {model_dir}")
     t0 = time.time()

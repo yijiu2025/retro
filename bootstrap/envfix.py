@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
-"""环境修复：让本目录下所有脚本在「conda 环境未激活」时也能正常 import。
+r"""环境修复：让本目录下所有脚本在「conda 环境未激活」时也能正常 import。
 
 用法：在脚本最顶部（任何第三方 import 之前）执行
-    import _envfix  # noqa: F401
+    from bootstrap import envfix  # noqa: F401
+
+脚本位于子目录时，先按 bootstrap/__init__.py 的说明把仓库根补进 sys.path。
 
 解决的问题：Windows 上 conda 未激活时 <env>\Library\bin 不在 PATH 中，
 _ssl.pyd 依赖的 libcrypto/libssl DLL 找不到，报

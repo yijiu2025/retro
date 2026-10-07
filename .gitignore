@@ -17,12 +17,18 @@ build/
 dist/
 
 # === 运行时日志 / 备份 ===
+# 启动脚本在仓库根，日志写在它旁边（根目录）
+_startup_log.txt
 web/_startup_log.txt
 *.log
 *.bak
 
-# === 旧的上游源码克隆目录（现已 vendored 到 upstream/，此目录不再需要）===
+# === 旧的上游源码克隆目录（已被 core/ 取代，2026-10-06 移出仓库）===
+# 规则保留：万一以后又被 clone 回来，也不要让它进版本库
 repo/
+
+# === 命令行工具产物（scripts/predict.py 生成的反应结构图）===
+outputs/
 
 # === 编辑器 / 系统 ===
 .vscode/
