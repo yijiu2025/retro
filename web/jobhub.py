@@ -521,8 +521,11 @@ def make_predict_runner(
         job.end_stage(detail=smiles)
         job.log(f"目标分子已规范化：{smiles}", level="info")
 
-        # 2) 模型在独立 worker 进程里（启动时已预加载），这里直接推理
-        job.skip_stage("load", "加载模型", "独立进程已预加载，跳过")
+        # 2) 模型跑在**独立常驻服务**里（web/model_server.py），本进程不加载。
+        #    🔴 这里以前写「独立进程已预加载，跳过」—— 现在模型可能还在后台加载
+        #        （API 是秒起的），那样说就是撒谎。如实描述：加载在哪、进度看
+        #        /api/models。若真没就绪，predict_fn 会抛一句说清原因的话。
+        job.skip_stage("load", "加载模型", "模型在独立常驻服务里，进度见 /api/models")
 
         # 3) 推理（经队列交给 worker 进程；worker 复用已起的规则子进程，不再 spawn）
         job.begin_stage("infer", "单步逆合成推理", f"Top{num_results}")
@@ -609,10 +612,13 @@ def make_search_runner(
         job.end_stage(detail=smiles)
         job.log(f"目标分子已规范化：{smiles}", level="info")
 
-        # 2) 模型在独立 worker 进程里已加载（启动时预加载），这里跳过 load 阶段
-        job.skip_stage("load", "加载模型", "独立进程已预加载，跳过")
+        # 2) 模型跑在**独立常驻服务**里（web/model_server.py），本进程不加载。
+        #    🔴 这里以前写「独立进程已预加载，跳过」—— 与 predict runner 同一个谎：
+        #        API 是秒起的，模型可能还在后台加载。如实描述加载在哪、进度看哪。
+        #        若真没就绪，search_fn 会抛一句说清原因的话（不会被静默吞掉）。
+        job.skip_stage("load", "加载模型", "模型在独立常驻服务里，进度见 /api/models")
 
-        # 3) 搜索（经队列交给 worker 进程；worker 里跑 RetroStar，预算在此真吃满）
+        # 3) 搜索在**模型服务进程**里跑（HTTP 转接，复用那里已加载的模型）。
         #    search 是唯一的重活，给它 0.92 的权重（validate/post 各占一点）；
         #    load 被 skip 掉不计入分母，所以 search 要拿掉进度条的大头。
         job.begin_stage("search", "多步路线搜索", "Retro* 广度优先 · 吃满调用预算", weight=0.92)

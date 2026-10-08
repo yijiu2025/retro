@@ -120,13 +120,17 @@ def main() -> int:
     print(f"[4] 搜索参数: max_calls={max_calls}, time_limit={time_limit}s, max_depth={max_depth}")
 
     print("[5] 运行 Retro* 搜索...")
+    # 同 web/model_runtime.py：num_calls() 是**累计**的缓存未命中数（只在 reset() 归零），
+    # 所以要传「基线 + 本次预算」。本脚本每次运行都重新加载模型、基线恒为 0，
+    # 两种写法等价；写成相对量是为了与常驻模型服务那条路径保持同一口径。
+    _calls_base = model.num_calls()
     t1 = time.time()
     searcher = RetroStarSearch(
         reaction_model=model,
         mol_inventory=inventory,
         value_function=ConstantNodeEvaluator(0.0),
         and_node_cost_fn=ReactionModelLogProbCost(),
-        limit_reaction_model_calls=max_calls,
+        limit_reaction_model_calls=_calls_base + max_calls,
         time_limit_s=time_limit,
         max_expansion_depth=max_depth,
     )

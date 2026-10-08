@@ -42,7 +42,6 @@ import json
 import threading
 import time
 import traceback
-import queue
 import concurrent.futures
 
 from flask import Flask, Response, jsonify, request
@@ -59,50 +58,35 @@ _CORE_DIR = os.path.join(_PARENT, "core")
 if os.path.isdir(_CORE_DIR) and _CORE_DIR not in sys.path:
     sys.path.append(_CORE_DIR)
 
-# --- 限制规则应用子进程数（必须在导入 retrochimera / syntheseus 之前） -------
-# 实现见 bootstrap/limit_workers.py：把 syntheseus 的 cpu_count() 固定为 4
-# （可用环境变量 RETRO_RULE_WORKERS 覆盖）。
-# 不限制的话 RuleApplicationServer 按 os.cpu_count()（本机 16）开子进程，
-# 每个子进程加载完整规则库约 4.4 GB → 合计约 70 GB，会把页面文件打满并报
-# "WinError 1455 页面文件太小，无法完成操作"。
-try:
-    if _PARENT not in sys.path:
-        sys.path.insert(0, _PARENT)
-    from bootstrap import limit_workers  # noqa: F401
-except Exception as _e:  # noqa: BLE001
-    print(f"[app] 注意：未能限制规则子进程数（{_e}）")
+# --- 规则子进程数限制：**已移到模型服务进程** -------------------------------
+# `bootstrap.limit_workers` 的实现就是 `import syntheseus` 然后打补丁，而它必须
+# 早于 retrochimera/syntheseus 导入。从前放在这里，等于**逼着 API 进程也把
+# syntheseus + torch 整个拖进来**（几十秒的启动成本），可 API 现在根本不跑模型。
+# 真正 spawn 规则子进程的只有模型服务进程，需要限制的是它 —— 见
+# web/model_server.py 顶部，那边 import 得更早。
+# 🔴 不要为了「保险」把这段加回来：一加 API 启动就慢几十秒，而且没有任何收益。
 
-# --- 模型目录：**默认按相对位置推导，可用环境变量覆盖** --------------------
-# 🔴 曾经写死 `F:\retrochimera\models\...` ⇒ 换台机器/换盘符就直接崩，
-#    而且报错是"找不到模型文件"，看不出是路径问题。
-#    现在的解析顺序（先到先用）：
-#      ① 环境变量 RETRO_MODELS_DIR      （整个模型根目录，推荐：换机只改这一处）
-#      ② 各模型单独的 RETRO_MODEL_<KEY> （只想挪某一个时用）
-#      ③ <仓库根>/models/<key>           （默认：web/ 的上一层）
-_MODELS_ROOT = os.environ.get("RETRO_MODELS_DIR") or os.path.join(
-    os.path.dirname(HERE), "models"
+# --- 模型表 / 纯算子：**单一来源在 model_runtime** -------------------------
+# 🔴 这里只 import，不再自己定义一份。模型服务进程（model_server.py）也要用
+#    同一份 MODELS 与同一套搜索逻辑 —— 两份定义一定会分叉，然后就是
+#    「API 说有这个模型、模型服务说不认识」这类查半天的怪事。
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+from model_client import ModelServiceClient  # noqa: E402
+from model_runtime import (  # noqa: E402
+    MODELS,
+    canon_smiles,
+    make_inventory,
+    make_value_function,
+    models_catalog,
+    run_retro_search,
 )
 
-
-def _model_path(env_key: str, dirname: str) -> str:
-    """单个模型的目录：环境变量优先，否则 <模型根>/<dirname>。"""
-    return os.environ.get(env_key) or os.path.join(_MODELS_ROOT, dirname)
-
-
-MODELS = {
-    "pistachio": {
-        "path": _model_path("RETRO_MODEL_PISTACHIO", "retrochimera_pistachio"),
-        "label": "Pistachio（主推，性能最强）",
-    },
-    "uspto50k": {
-        "path": _model_path("RETRO_MODEL_USPTO50K", "retrochimera_uspto50k"),
-        "label": "USPTO-50K（基准模型，较弱）",
-    },
-}
+#: 常驻模型服务的客户端（API 进程访问模型的**唯一**入口）。
+#: 模型不在本进程里 —— 本进程既不加载、也不 spawn 规则子进程。
+_model_service = ModelServiceClient()
 
 app = Flask(__name__, static_folder=None)
-_lock = threading.Lock()
-_loaded: dict = {}
 
 # --- CORS：仅当配置了 RETRO_CORS_ORIGINS 时才启用 -------------------------
 # 🔴 dev 走 vite proxy（同源），不需要 CORS；但**换机部署时前端往往在另一个域名**，
@@ -142,17 +126,15 @@ def _cors_preflight(_sub: str = ""):
     """预检请求：after_request 已经补好头，这里返回 204 即可。"""
     return ("", 204)
 
-# --- 独立模型 worker 进程（单线程，彻底绕开 Windows spawn 死锁） ---
-# 🔴 为什么必须另起一个进程：
-#    RetroChimera 用 multiprocessing 起规则子进程，而 Windows 的 spawn 在
-#    「已有其他线程存活的进程」里会死锁（子进程 re-import 主模块时卡死）。
-#    Flask 一跑起来就有请求线程，所以**绝不能在本进程里 spawn**。
-#    解决办法：模型放在一个**独立、单线程**的 worker 进程里（它自己启动时
-#    单线程 spawn 规则子进程，安全），Flask 只通过队列把请求递过去、拿结果回来。
-_REQ_Q = None
-_RESP_Q = None
-_WORKER_READY = threading.Event()
-_WORKER_FAILED = False
+# --- 模型跑在独立常驻服务里（见 web/model_server.py） -----------------------
+# 本进程（API）**不再加载模型、不再 spawn 规则子进程**，只做 HTTP 转接。
+# 好处有三条，都是实打实省时间的：
+#   1. 启动不再等模型 —— 从前这里阻塞等 ready（40~90 秒起，冷盘更久），
+#      期间连 /api/parse、/api/depict、AI 分析这些跟模型无关的接口都连不上，
+#      前端全屏报「网络错误」，看不出是在等模型；
+#   2. 改 API 代码重启 ⇒ 模型服务还活着 ⇒ 直接复用，**模型不重载**；
+#   3. 本进程永不 import torch/syntheseus ⇒ 起得快，也不可能踩 spawn 死锁。
+# 状态与推理全部经 `_model_service`（见文件上部）转接；前端只跟本服务说话。
 
 # --- 任务中心：把长任务变成可查询、可取消、带阶段与日志的 job -----------------
 # 详见 web/jobhub.py。此处只 import 并绑定模型缓存引用；runner 需要 get_model 与
@@ -161,7 +143,9 @@ _WORKER_FAILED = False
 try:
     import jobhub
 
-    jobhub.bind_loaded_cache(_loaded)
+    # 🔴 模型已经移出本进程 ⇒ 这里没有「已加载模型」的引用可以绑了。
+    #    传空字典即可：jobhub 的 _peek_loaded() 目前没有调用点，保留只为兼容。
+    jobhub.bind_loaded_cache({})
 except Exception as _e:  # noqa: BLE001
     jobhub = None  # type: ignore[assignment]
     print(f"[app] 注意：任务中心未启用（{_e}），/api/predict 仍可用但无进度", flush=True)
@@ -200,428 +184,82 @@ def _setup_jobhub():
     return _PREDICT_RUNNER
 
 
-def get_model(key: str):
-    """按需加载并缓存模型。"""
-    if key in _loaded:
-        return _loaded[key]
-    with _lock:
-        if key in _loaded:
-            return _loaded[key]
-        from retrochimera import RetroChimeraModel
+def _require_model_ready(model_key: str = "") -> dict:
+    """模型服务必须就绪，否则抛出**说得清**的原因。
 
-        info = MODELS.get(key)
-        if info is None:
-            raise ValueError(f"未知模型: {key}")
-        model = RetroChimeraModel(model_dir=info["path"])
-        _loaded[key] = model
-        return model
-
-
-# --------------------------------------------------------------------------
-# 独立模型 worker 进程：只做一件事 —— 加载模型 + 在队列上处理推理请求。
-# 它自身是「单线程进程」，启动时 spawn 规则子进程是安全的；推理时复用已起的
-# 子进程，不再 spawn。Flask 主进程通过下面两个队列与它通信，永不自己 spawn。
-# --------------------------------------------------------------------------
-def model_worker_main(req_q, resp_q, model_key: str) -> None:
-    """worker 进程的入口（在独立进程的主线程里运行）。
-
-    🔴 注意：本函数由 multiprocessing 在子进程里调用，子进程会先 re-import
-    本模块（app.py），顶部的 DLL 修复会再次执行，因此子进程能正常 import ssl。
+    🔴 从前模型未就绪时下游只会甩一句类型错误（对着一份没加载的模型调推理），
+       用户看到的是「NoneType is not callable」这类完全指不出方向的话。
+       把「正在加载 / 没启动 / 加载的是别的模型」三种情况分开讲清楚。
     """
-    import traceback as _tb
-
-    try:
-        from retrochimera import RetroChimeraModel
-        from syntheseus import Molecule
-    except Exception as e:  # noqa: BLE001
-        resp_q.put({"type": "ready", "error": f"{type(e).__name__}: {e}"})
-        return
-
-    info = MODELS.get(model_key)
-    if info is None:
-        resp_q.put({"type": "ready", "error": f"未知模型: {model_key}"})
-        return
-
-    try:
-        print(f"[worker] 加载模型「{model_key}」……", flush=True)
-        model = RetroChimeraModel(model_dir=info["path"])
-        print(f"[worker] ✓ 模型「{model_key}」已加载，规则子进程就绪", flush=True)
-    except Exception as e:  # noqa: BLE001
-        resp_q.put(
-            {
-                "type": "ready",
-                "error": f"模型加载失败: {type(e).__name__}: {e}",
-                "traceback": _tb.format_exc(),
-            }
+    st = _model_service.status()
+    if st.get("state") == "loading":
+        elapsed = float(st.get("elapsed") or 0)
+        raise RuntimeError(
+            f"模型「{st.get('model') or model_key or '默认'}」正在加载中"
+            f"（{st.get('phase') or '加载中'}，已 {elapsed:.0f}s）—— 就绪后重试即可"
         )
-        return
+    if not st.get("running"):
+        raise RuntimeError("模型服务未运行 —— 请在「运行参数 → 预测模型」里点「加载模型」")
+    if st.get("state") != "ready":
+        raise RuntimeError(
+            f"模型服务状态异常（{st.get('state')}）"
+            + (f"：{st['error']}" if st.get("error") else "")
+        )
+    cur = st.get("model") or ""
+    if model_key and cur and cur != model_key:
+        raise RuntimeError(
+            f"模型服务当前加载的是「{cur}」，"
+            f"请先在「运行参数 → 预测模型」里切到「{model_key}」"
+        )
+    return st
 
-    # 加载成功：先回一个 ready，再进入请求循环
-    resp_q.put({"type": "ready"})
 
-    while True:
-        req = req_q.get()
-        if req is None:
-            break
-        try:
-            if req.get("kind") == "search":
-                # 🔴 搜索也在 worker 里跑：复用这里已经加载的 model，不在 Flask 进程
-                #    再载一份（否则内存翻倍）。run_retro_search 是纯函数，只依赖传入
-                #    的 model 对象，与同步 /api/search 共用同一份逻辑。
-                result = run_retro_search(
-                    model,
-                    smiles=req["smiles"],
-                    max_routes=req.get("max_routes", 5),
-                    max_calls=req.get("max_calls", 60),
-                    time_limit=req.get("time_limit", 120.0),
-                    max_depth=req.get("max_depth", 3),
-                    max_heavy_atoms=req.get("max_heavy_atoms", 10),
-                    value_fn=req.get("value_fn", "complexity"),
-                    purchasable=req.get("purchasable") or [],
-                    required_materials=req.get("required_materials") or [],
-                )
-                resp_q.put({"type": "result", "id": req["id"], "ok": True, "search": result})
-                continue
-            preds = model([Molecule(req["smiles"])], num_results=req["num_results"])
-            # 🔴 str(p) 是**反应 SMILES**（reactants>>product），不是纯前体；
-            #    反应物侧的拆解在 jobhub 的 runner 里做（reaction -> precursor_list）。
-            out = [
-                {"reaction": str(p), "probability": float(p.metadata["probability"])}
-                for p in preds[0]
-            ]
-            resp_q.put({"type": "result", "id": req["id"], "ok": True, "results": out})
-        except Exception as e:  # noqa: BLE001
-            resp_q.put(
-                {
-                    "type": "result",
-                    "id": req["id"],
-                    "ok": False,
-                    "error": f"{type(e).__name__}: {e}",
-                    "traceback": _tb.format_exc(),
-                }
-            )
+def service_status() -> dict:
+    """模型服务当前状态（HTTP 优先，文件回退）。"""
+    return _model_service.status()
 
 
 def predict_remote(smiles: str, model_key: str, num_results: int) -> list:
-    """推理桥：把请求丢进队列，阻塞等 worker 进程的结果回来。
+    """推理桥：HTTP 转接到常驻模型服务。
 
-    返回 worker 给的纯数据列表：[{precursors, probability}, ...]。
-    本函数运行在 Flask 主线程的 job pump 里，只做 IPC，绝不 spawn 子进程。
+    从前这里是把请求丢进 multiprocessing 队列、阻塞等 worker 回结果；现在模型在
+    **独立常驻服务**里（web/model_server.py），本进程只做转发 —— 因此不可能再
+    碰到 Windows「多线程进程里 spawn 死锁」，也不会因为本进程重启而丢掉已加载的模型。
     """
-    global _WORKER_FAILED
-    if _WORKER_FAILED or _REQ_Q is None or _RESP_Q is None:
-        raise RuntimeError("模型 worker 进程未就绪（可能启动失败或已崩溃）")
-    import uuid
-
-    rid = uuid.uuid4().hex
-    _REQ_Q.put({"id": rid, "smiles": smiles, "model": model_key, "num_results": num_results})
-    while True:
-        try:
-            resp = _RESP_Q.get(timeout=float(os.environ.get("RETRO_WORKER_TIMEOUT", "900")))
-        except Exception:  # noqa: BLE001
-            raise RuntimeError("模型 worker 进程无响应（可能已崩溃）")
-        if resp.get("type") == "ready":
-            # 理论上 ready 已被 main() 消费；此处兜底处理
-            if resp.get("error"):
-                _WORKER_FAILED = True
-                raise RuntimeError("模型 worker 启动失败：" + resp["error"])
-            _WORKER_READY.set()
-            continue
-        if resp.get("id") == rid:
-            if not resp.get("ok"):
-                raise RuntimeError(resp.get("error", "模型推理失败"))
-            return resp["results"]
+    _require_model_ready(model_key)
+    return _model_service.predict(smiles, num_results)
 
 
 def search_remote(params: dict) -> dict:
-    """搜索桥：把 search 请求丢进队列，阻塞等 worker 进程的 Retro* 结果回来。
-
-    返回 worker 给的已序列化搜索结果 dict（routes / starting_materials / stats）。
-    本函数运行在 Flask 主线程的 job pump 里，只做 IPC，绝不 spawn 子进程。
-    与 predict_remote 唯一区别：请求带 `kind: "search"`、结果读 `search` 字段。
-    """
-    global _WORKER_FAILED
-    if _WORKER_FAILED or _REQ_Q is None or _RESP_Q is None:
-        raise RuntimeError("模型 worker 进程未就绪（可能启动失败或已崩溃）")
-    import uuid
-
-    rid = uuid.uuid4().hex
-    _REQ_Q.put({"id": rid, "kind": "search", **params})
-    while True:
-        try:
-            resp = _RESP_Q.get(timeout=float(os.environ.get("RETRO_WORKER_TIMEOUT", "1800")))
-        except Exception:  # noqa: BLE001
-            raise RuntimeError("模型 worker 进程无响应（可能已崩溃）")
-        if resp.get("type") == "ready":
-            if resp.get("error"):
-                _WORKER_FAILED = True
-                raise RuntimeError("模型 worker 启动失败：" + resp["error"])
-            _WORKER_READY.set()
-            continue
-        if resp.get("id") == rid:
-            if not resp.get("ok"):
-                raise RuntimeError(resp.get("error", "搜索失败"))
-            return resp.get("search", {})
+    """搜索桥：HTTP 转接到常驻模型服务（返回 run_retro_search 的那个 dict）。"""
+    _require_model_ready(str(params.get("model") or ""))
+    return _model_service.search(params)
 
 
 # --------------------------------------------------------------------------
-# 退出清理：安静地关掉规则应用子进程
+# 退出清理：模型服务是**常驻**的，默认不随本进程退出
 # --------------------------------------------------------------------------
-# 背景：RetroChimera 的 RuleApplicationServer 会 spawn 若干子进程（每个约 4.4 GB），
-# 官方在 __init__ 里注册了 weakref.finalize 做清理，但 **Ctrl+C 或直接关窗口时
-# finalize 来不及执行** → 子进程变成孤儿、并在控制台刷出满屏
-# "BrokenPipeError: [WinError 109] 管道已结束" 的 traceback（看着像崩溃，其实无害）。
-# 这里显式注册退出钩子，主动调用 server.close()，让退出过程安静、不留残留进程。
-def _iter_rule_servers(obj, seen=None, depth=0):
-    """在模型对象里找出所有 RuleApplicationServer 实例。
-
-    实测结构（retrochimera 1.3.0）：
-        RetroChimeraModel
-          └─ _models: list[BackwardReactionModel]
-               ├─ TemplateClassificationModel._server = RuleApplicationServer
-               └─ TemplateLocalizationModel._server   = RuleApplicationServer
-    所以必须同时遍历「属性」和「容器元素」，否则一个都找不到。
-    """
-    if seen is None:
-        seen = set()
-    if obj is None or depth > 7 or id(obj) in seen:
-        return
-    seen.add(id(obj))
-
-    # 命中目标
-    if type(obj).__name__ == "RuleApplicationServer":
-        yield obj
-        return
-
-    # 容器：list / tuple / set / dict value
-    if isinstance(obj, dict):
-        for v in list(obj.values()):
-            yield from _iter_rule_servers(v, seen, depth + 1)
-        return
-    if isinstance(obj, (list, tuple, set, frozenset)):
-        for v in list(obj):
-            yield from _iter_rule_servers(v, seen, depth + 1)
-        return
-
-    # 只下潜到自定义对象，避免遍历 torch/numpy 的大对象图
-    mod = type(obj).__module__ or ""
-    if mod.startswith(("torch", "numpy", "rdkit", "syntheseus")):
-        return
-
-    # 1) 已知属性名
-    for attr in ("_server", "_rule_model", "_reaction_model", "model", "_model", "_models"):
-        try:
-            child = getattr(obj, attr, None)
-        except Exception:  # noqa: BLE001
-            continue
-        if child is not None:
-            yield from _iter_rule_servers(child, seen, depth + 1)
-
-    # 2) 兜底：按属性名模糊扫描（属性名单可能随版本变化）
-    try:
-        attrs = vars(obj)
-    except Exception:  # noqa: BLE001
-        attrs = {}
-    for name, child in list(attrs.items()):
-        if name.startswith("__") or child is None:
-            continue
-        low = name.lower()
-        if ("server" in low or "rule" in low) and name not in (
-            "_server", "_rule_model", "_reaction_model", "model", "_model", "_models",
-        ):
-            yield from _iter_rule_servers(child, seen, depth + 1)
-
-
-def _shutdown_workers():
-    """退出时关闭所有规则子进程（幂等、绝不抛异常）。"""
-    closed = 0
-    for model in list(_loaded.values()):
-        for server in _iter_rule_servers(model):
-            try:
-                if getattr(server, "_running", False):
-                    server.close()
-                    closed += 1
-            except Exception:  # noqa: BLE001
-                pass
-    if closed:
-        print(f"[app] 已关闭 {closed} 组规则子进程，正常退出", flush=True)
-
-
-def _stop_worker(worker):
-    """优雅关闭模型 worker 进程（非 daemon，需显式回收）。
-
-    - 先往请求队列丢一个 None，让 worker 的 `while True` 循环 break，
-      触发 RuleApplicationServer 的 finalize 自动杀掉规则子进程；
-    - join 等待（最多 30s，留给正在跑的推理收尾）；
-    - 仍未退出（如推理卡死）则 terminate 强杀。
-    """
-    if worker is None:
-        return
-    try:
-        if _REQ_Q is not None:
-            _REQ_Q.put(None)
-    except Exception:  # noqa: BLE001
-        pass
-    try:
-        worker.join(timeout=30)
-    except Exception:  # noqa: BLE001
-        pass
-    if worker.is_alive():
-        try:
-            worker.terminate()
-        except Exception:  # noqa: BLE001
-            pass
+# 从前这里有一大套 _iter_rule_servers / _shutdown_workers / _stop_worker，
+# 用来在退出时回收规则子进程 —— 那是因为模型就住在本进程里。
+# 现在模型搬进了独立的模型服务进程（web/model_server.py），它自己负责回收
+# （见那边的 _bye / SetConsoleCtrlHandler）。本进程退出时**默认不动它**：
+# 「重启 API 不重载模型」正是靠这一点成立的。
+# 想让模型服务跟着 API 一起退（省内存）就设 RETRO_MODEL_STOP_WITH_API=1。
 
 
 def _install_exit_hooks():
     import atexit
-    import signal
 
-    atexit.register(_shutdown_workers)
-
-    # Ctrl+C：先清子进程，再让默认 KeyboardInterrupt 流程走完
-    def _sigint(signum, frame):
-        _shutdown_workers()
-        # 恢复默认处理，第二次 Ctrl+C 可强制退出
-        try:
-            signal.signal(signal.SIGINT, signal.default_int_handler)
-        except Exception:  # noqa: BLE001
-            pass
-        raise KeyboardInterrupt
-
-    try:
-        signal.signal(signal.SIGINT, _sigint)
-    except Exception:  # noqa: BLE001
-        pass
-
-    # Windows：直接点窗口右上角 × 关闭时，用 SetConsoleCtrlHandler 接管，
-    # 先回收规则子进程再退出（否则子进程会变孤儿并刷满屏 BrokenPipeError）。
-    try:
-        import ctypes
-        from ctypes import wintypes
-
-        HANDLER_ROUTINE = ctypes.WINFUNCTYPE(
-            wintypes.BOOL, wintypes.DWORD
-        )
-
-        def _console_handler(ctrl_type):
-            # 0=CTRL_C, 1=CTRL_BREAK, 2=CTRL_CLOSE, 5=CTRL_LOGOFF, 6=CTRL_SHUTDOWN
-            try:
-                _shutdown_workers()
-            except Exception:  # noqa: BLE001
-                pass
-            return False  # 返回 False → 继续执行默认处理，进程正常退出
-
-        # 必须保存引用，否则回调会被 GC 回收导致崩溃
-        global _CTRL_HANDLER
-        _CTRL_HANDLER = HANDLER_ROUTINE(_console_handler)
-        ctypes.windll.kernel32.SetConsoleCtrlHandler(_CTRL_HANDLER, True)
-    except Exception:  # noqa: BLE001
-        pass
+    atexit.register(_model_service.shutdown_if_owned)
 
 
 # --------------------------------------------------------------------------
-# 库存策略：决定搜索何时终止（哪些分子视为「可购买的起始物料」）
+# 分子库存 / 价值函数 / 路线搜索：**单一来源在 model_runtime**
 # --------------------------------------------------------------------------
-_canon_cache: dict = {}
-
-
-def canon_smiles(smi):
-    """把 SMILES 规范化成 RDKit canonical 形式；无法解析返回 None。
-
-    为什么必须规范化：搜索过程中模型返回的分子写法，和用户手工输入/从
-    ChemDraw 复制的写法经常不同（原子顺序、等价分支的书写顺序都可能不一样），
-    直接做字符串比较会导致「指定的起始物料」几乎永远匹配不上，白名单形同虚设。
-    """
-    if not smi:
-        return None
-    if smi in _canon_cache:
-        return _canon_cache[smi]
-    try:
-        from rdkit import Chem
-
-        mol = Chem.MolFromSmiles(smi)
-        result = Chem.MolToSmiles(mol) if mol is not None else None
-    except Exception:  # noqa: BLE001
-        result = None
-    _canon_cache[smi] = result
-    return result
-
-
-def make_inventory(max_heavy_atoms=10, purchasable=None):
-    """构造分子库存判定器。
-
-    max_heavy_atoms: 重原子数不超过该值的分子视为「可购买」。
-    purchasable:     额外指定的可购买分子 SMILES 列表。命中即视为可购买
-                     （搜索**不再往下拆它**），与上面的重原子规则是「或」关系。
-                     比较用 canonical SMILES，因此写法不同也能正确匹配。
-    """
-    from rdkit import Chem
-    from syntheseus.search.mol_inventory import BaseMolInventory
-
-    extra = {c for c in (canon_smiles(s) for s in (purchasable or [])) if c}
-
-    class HeuristicInventory(BaseMolInventory):
-        def is_purchasable(self, mol) -> bool:
-            if extra:
-                canon = canon_smiles(mol.smiles)
-                if canon is not None and canon in extra:
-                    return True
-            try:
-                m = Chem.MolFromSmiles(mol.smiles)
-                return m is not None and m.GetNumHeavyAtoms() <= max_heavy_atoms
-            except Exception:  # noqa: BLE001
-                return False
-
-    return HeuristicInventory()
-
-
-def make_value_function(kind, inventory, max_heavy_atoms):
-    """构造 Retro* 的 value function：估计「从该分子出发还需要几步」。
-
-    - "constant"   : 恒为 0。这是 syntheseus 的最简默认值，效果等于关闭启发式
-                     引导，搜索退化为纯粹按反应概率（-logP）做 best-first。
-    - "complexity" : 按重原子数估计剩余步数——分子越大，通常越需要多拆几步。
-                     搜索因此会优先处理「已经接近可购买」的分支，在预算有限时
-                     更容易把某一条分支一路走通，而不是把预算平摊在所有分支上。
-
-    该值是「代价估计」，越大表示越不值得优先扩展。启发式以 1 步为下界
-    （任何不可购买的分子至少还要 1 步），不会低估，因此不会牺牲找到可行路线的能力。
-    """
-    from syntheseus.search.node_evaluation.common import ConstantNodeEvaluator
-
-    if kind != "complexity":
-        return ConstantNodeEvaluator(0.0)
-
-    from rdkit import Chem
-    from syntheseus.search.graph.and_or import OrNode
-    from syntheseus.search.node_evaluation.base import NoCacheNodeEvaluator
-
-    atoms_per_step = 5.0  # 每多 5 个重原子，估计多需要 1 步
-
-    class ComplexityValueFunction(NoCacheNodeEvaluator[OrNode]):
-        def _evaluate_nodes(self, nodes, graph=None):
-            values = []
-            for node in nodes:
-                mol = getattr(node, "mol", None)
-                if mol is None:
-                    values.append(0.0)
-                    continue
-                try:
-                    if inventory.is_purchasable(mol):
-                        values.append(0.0)
-                        continue
-                    rd_mol = Chem.MolFromSmiles(mol.smiles)
-                    n_atoms = (
-                        rd_mol.GetNumHeavyAtoms() if rd_mol is not None else max_heavy_atoms
-                    )
-                except Exception:  # noqa: BLE001
-                    values.append(1.0)
-                    continue
-                values.append(1.0 + max(0, n_atoms - max_heavy_atoms) / atoms_per_step)
-            return values
-
-    return ComplexityValueFunction()
+# 🔴 canon_smiles / make_inventory / make_value_function / run_retro_search
+#    都已在文件顶部从 model_runtime import —— 模型服务进程要用同一份实现。
+#    这里再定义一遍就会出现「API 算出的起始物料」和「模型服务搜索时用的口径」
+#    不一致，而且属于平时看不出来、只在边界分子上冒头的那种不一致。
 
 
 # --------------------------------------------------------------------------
@@ -631,10 +269,15 @@ def make_value_function(kind, inventory, max_heavy_atoms):
 #    访问根路径给一份自描述，方便浏览器直接打开时知道这是哪儿、有哪些接口。
 _API_INDEX = {
     "service": "RetroChimera API",
-    "hint": "本服务只提供 API。前端界面在 retroweb 仓库，由它来调用这些接口。",
+    "hint": (
+        "本服务只提供 API。前端界面在 retroweb 仓库，由它来调用这些接口。"
+        "模型跑在独立的常驻服务里（默认 127.0.0.1:8001），本服务只做转接 —— "
+        "所以本服务可以秒起，模型在后台慢慢加载。"
+    ),
     "endpoints": [
-        {"method": "GET", "path": "/api/models", "desc": "可用模型 + 是否已加载"},
-        {"method": "POST", "path": "/api/load", "desc": "预热：提前把模型加载进内存"},
+        {"method": "GET", "path": "/api/models", "desc": "模型状态矩阵（每个模型 idle/loading/ready/failed + 服务概览）"},
+        {"method": "POST", "path": "/api/load", "desc": "加载/切换模型（后启动；立刻返回，进度看 /api/models）"},
+        {"method": "POST", "path": "/api/model-service/<action>", "desc": "模型服务 start / stop / restart"},
         {"method": "POST", "path": "/api/predict", "desc": "单步逆合成预测"},
         {"method": "POST", "path": "/api/search", "desc": "多步路线搜索（脚本/调试用）"},
         {"method": "POST", "path": "/api/parse", "desc": "结构文本 → 规范结构 + 分子式/分子量"},
@@ -671,15 +314,17 @@ def api_index():
 
 @app.route("/api/models")
 def api_models():
-    return jsonify(
-        {
-            "ok": True,
-            "models": [
-                {"key": k, "label": v["label"], "loaded": _WORKER_READY.is_set()}
-                for k, v in MODELS.items()
-            ],
-        }
-    )
+    """模型状态矩阵 —— 前端只认这一个入口。
+
+    每行给出：文件在不在、当前什么状态（idle / loading / ready / failed /
+    unavailable）、多大、是不是当前加载的那个；外加一份 service 概览
+    （模型服务在不在跑、加载到哪一步、错误是什么）。
+
+    🔴 从前这里把所有模型都报 `loaded: 全局布尔` —— 实际只有预加载那一个真的
+       加载了，另一个是假的，前端于是显示「已加载」却一预测就失败。现在按
+       **每个模型**的真实状态报，没加载的就是 idle，点一下才后启动。
+    """
+    return jsonify(_model_service.catalog(models_catalog()))
 
 
 # --------------------------------------------------------------------------
@@ -964,18 +609,80 @@ def api_depict():
 
 @app.route("/api/load", methods=["POST"])
 def api_load():
-    """查询/触发模型就绪状态。
+    """加载 / 切换模型 —— 「模型后启动」就发生在这里。
 
-    🔴 模型现在跑在独立的 worker 进程里（见 model_worker_main），由 main() 启动时
-    自动加载，Flask 本进程不再直接加载模型。这里只回报 worker 是否就绪。
+    body: {model: "pistachio"}（不传则用 RETRO_PRELOAD，再退到第一个可用的）
+
+    语义：
+      - 模型服务没在跑 ⇒ 拉起它（模型在后台慢慢加载）
+      - 在跑但加载的是别的 ⇒ 停掉旧的、拉起新的（一次只留一个，省内存）
+      - 已经就是它 ⇒ 直接返回，不折腾
+
+    🔴 返回的是「**已经开始加载**」，不是「已经就绪」。加载要 40~90 秒，
+       让这个 HTTP 请求挂在这里等，前端就只能看到一个转圈，也分不清是卡死
+       还是在正常加载。前端应当拿返回的状态继续轮询 /api/models，
+       直到该模型 state 变成 ready。
     """
-    return jsonify(
-        {
-            "ok": _WORKER_READY.is_set() and not _WORKER_FAILED,
-            "loaded": _WORKER_READY.is_set(),
-            "failed": _WORKER_FAILED,
-        }
-    )
+    data = request.get_json(force=True, silent=True) or {}
+    key = str(data.get("model") or "").strip()
+    if not key:
+        key = str(os.environ.get("RETRO_PRELOAD") or "").strip()
+    catalog = models_catalog()
+    if not key or key not in MODELS:
+        key = next((m["key"] for m in catalog if m["exists"]), "")
+    if not key:
+        return jsonify({"ok": False, "error": "没有可用模型：models/ 目录是空的"}), 400
+
+    row = next((m for m in catalog if m["key"] == key), None)
+    if row is not None and not row["exists"]:
+        return jsonify({"ok": False, "error": f"模型文件不存在：{row['path']}"}), 400
+
+    try:
+        svc = _model_service.load(key)
+    except Exception as e:  # noqa: BLE001
+        traceback.print_exc()
+        return (
+            jsonify({"ok": False, "error": f"启动模型服务失败：{type(e).__name__}: {e}"}),
+            500,
+        )
+    return jsonify({"ok": True, "model": key, "started": True, "service": svc})
+
+
+@app.route("/api/model-service/<action>", methods=["POST"])
+def api_model_service(action: str):
+    """模型服务的启停（前端「加载模型 / 停止模型服务」两个按钮）。
+
+    action: start | stop | restart
+    body:   {model?: "..."}（start/restart 时可指定要加载哪个）
+
+    🔴 单独开这个口子是为了让「模型服务」和「其他后端」真的能分开操作：
+       改完代码重启 API 时，模型服务不受影响；反过来想省内存时，
+       可以只停模型服务，API 照常提供解析 / 绘制 / AI 分析等能力。
+    """
+    act = action.strip().lower()
+    data = request.get_json(force=True, silent=True) or {}
+    key = str(data.get("model") or "").strip()
+
+    if act == "stop":
+        res = _model_service.stop()
+        return jsonify({"ok": True, "action": "stop", "service": res})
+    if act in ("start", "restart"):
+        if not key:
+            key = str(os.environ.get("RETRO_PRELOAD") or "").strip()
+        if not key:
+            key = next((m["key"] for m in models_catalog() if m["exists"]), "")
+        if not key or key not in MODELS:
+            return jsonify({"ok": False, "error": f"未知模型: {key or '(空)'}"}), 400
+        try:
+            # 🔴 restart 必须**真的重启**：load() 默认在「已在跑同一模型」时直接复用
+            #    （那是 start 的语义）。不 force 的话，改完 model_runtime 的代码点
+            #    「重启」等于没重启，而返回体照样是 ok/already —— 从结果上完全看不出来。
+            res = _model_service.load(key, force=(act == "restart"))
+        except Exception as e:  # noqa: BLE001
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": f"{type(e).__name__}: {e}"}), 500
+        return jsonify({"ok": True, "action": act, "model": key, "service": res})
+    return jsonify({"ok": False, "error": f"未知操作: {action}（可用 start / stop / restart）"}), 400
 
 
 # --------------------------------------------------------------------------
@@ -1591,27 +1298,29 @@ def api_predict():
         return jsonify(err), 400
 
     try:
-        from syntheseus import Molecule
-
         t0 = time.time()
-        model = get_model(model_key)
-        load_s = time.time() - t0
-
-        t1 = time.time()
-        preds = model([Molecule(smiles)], num_results=num_results)
-        infer_s = time.time() - t1
+        raw = predict_remote(smiles, model_key, num_results)
+        infer_s = time.time() - t0
 
         results = []
-        for i, p in enumerate(preds[0], 1):
-            prob = float(p.metadata["probability"])
-            smi = str(p)
+        for i, c in enumerate(raw, 1):
+            # 🔴 与 /api/jobs 的 runner 保持同一口径：模型给的是**反应 SMILES**
+            #    （"reactants>>product"），前体必须取 ">>" 左侧，否则最后一个片段
+            #    会带着 ">>产品"，下游会当成非法分子。
+            rxn = str(c.get("reaction") or c.get("precursors") or "")
+            prob = float(c.get("probability") or 0.0)
+            left, sep, right = rxn.partition(">>")
+            reactant_str = left if sep else rxn
+            parts = [p for p in reactant_str.split(".") if p]
             results.append(
                 {
                     "rank": i,
-                    "precursors": smi,
-                    "precursor_list": smi.split("."),
+                    "precursors": reactant_str,
+                    "precursor_list": parts,
+                    "reaction": rxn,
+                    "product": right if sep else "",
                     "probability": prob,
-                    "num_molecules": len(smi.split(".")),
+                    "num_molecules": len(parts),
                     "level": "high" if prob > 0.5 else ("mid" if prob > 0.1 else "low"),
                 }
             )
@@ -1622,7 +1331,6 @@ def api_predict():
                 "product": smiles,
                 "model": model_key,
                 "results": results,
-                "load_seconds": round(load_s, 1),
                 "infer_seconds": round(infer_s, 1),
             }
         )
@@ -1631,138 +1339,14 @@ def api_predict():
         return jsonify({"ok": False, "error": f"{type(e).__name__}: {e}"}), 500
 
 
-def run_retro_search(model, *, smiles, max_routes=5, max_calls=60, time_limit=120.0,
-                     max_depth=3, max_heavy_atoms=10, value_fn="complexity",
-                     purchasable=None, required_materials=None):
-    """跑一次 Retro* 搜索并提取路线（**纯函数，只依赖传入的 model 对象**）。
-
-    🔴 为什么把这段从 /api/search 抽出来、且接受「model 对象」而不是 model_key：
-        搜索任务要在**独立 worker 进程**里跑（复用那里已加载的模型，不在 Flask 进程
-        再载一份），而 worker 里已经有 model 实例。同步 /api/search 则传 `get_model(key)`。
-        两者共用这一份逻辑，避免「同步接口和异步任务各写一遍、结果不一致」。
-
-    返回 dict（不含 jsonify 包装）：{ok, target, model, routes, starting_materials,
-    purchasable, required_materials, filtered_out, value_fn, stats, load_seconds,
-    search_seconds}。异常由调用方决定如何呈现。
-    """
-    from syntheseus import Molecule
-    from syntheseus.search.algorithms.best_first.retro_star import RetroStarSearch
-    from syntheseus.search.analysis.route_extraction import iter_routes_time_order
-    from syntheseus.search.graph.and_or import AndNode, OrNode
-    from syntheseus.search.node_evaluation.common import ReactionModelLogProbCost
-
-    # 参数保护（与 /api/search 同一套边界，别让 worker 端收到越界值）
-    max_routes = max(1, min(int(max_routes), 20))
-    max_calls = max(5, min(int(max_calls), 400))
-    time_limit = max(10.0, min(float(time_limit), 600.0))
-    max_depth = max(1, min(int(max_depth), 8))
-    max_heavy_atoms = max(1, min(int(max_heavy_atoms), 40))
-    if value_fn not in ("constant", "complexity"):
-        value_fn = "complexity"
-
-    inventory = make_inventory(max_heavy_atoms, purchasable)
-
-    t1 = time.time()
-    searcher = RetroStarSearch(
-        reaction_model=model,
-        mol_inventory=inventory,
-        value_function=make_value_function(value_fn, inventory, max_heavy_atoms),
-        and_node_cost_fn=ReactionModelLogProbCost(),
-        limit_reaction_model_calls=max_calls,
-        time_limit_s=time_limit,
-        max_expansion_depth=max_depth,
-    )
-    graph, _ = searcher.run_from_mol(Molecule(smiles))
-    search_s = time.time() - t1
-
-    # ---- 提取路径 ----
-    or_nodes = [n for n in graph.nodes() if isinstance(n, OrNode)]
-    and_nodes = [n for n in graph.nodes() if isinstance(n, AndNode)]
-
-    routes = []
-    for nodes in iter_routes_time_order(graph, max_routes=max_routes):
-        steps = []
-        for n in nodes:
-            if not isinstance(n, AndNode):
-                continue
-            rxn = n.reaction
-            try:
-                prob = rxn.metadata.get("probability")
-            except Exception:  # noqa: BLE001
-                prob = None
-            reactants = sorted(m.smiles for m in rxn.reactants)
-            steps.append(
-                {
-                    "product": rxn.product.smiles,
-                    "reactants": reactants,
-                    "reactants_joined": ".".join(reactants),
-                    "probability": float(prob) if prob is not None else None,
-                }
-            )
-        if steps:
-            probs = [s["probability"] for s in steps if s["probability"] is not None]
-            total = 1.0
-            for p in probs:
-                total *= p
-            routes.append(
-                {
-                    "steps": steps,
-                    "num_steps": len(steps),
-                    "total_probability": total if probs else None,
-                    "material_count": sum(
-                        1
-                        for s in steps
-                        for r in s["reactants"]
-                        if not any(r == t["product"] for t in steps)
-                    ),
-                }
-            )
-
-    # ---- 「路线必须包含指定原料」过滤 ----
-    filtered_out = 0
-    if required_materials:
-        required_set = set(required_materials)
-        kept = []
-        for rt in routes:
-            present = set()
-            for step in rt["steps"]:
-                present.add(step["product"])
-                present.update(step["reactants"])
-            present_canon = {c for c in (canon_smiles(x) for x in present) if c}
-            if required_set.issubset(present_canon):
-                kept.append(rt)
-        filtered_out = len(routes) - len(kept)
-        routes = kept
-
-    # 按总概率降序
-    routes.sort(key=lambda r: (r["total_probability"] is None, -(r["total_probability"] or 0)))
-
-    # 路线里出现的所有分子（用于标注起始物料）
-    all_products = {s["product"] for r in routes for s in r["steps"]}
-    starting_materials = set()
-    for r in routes:
-        for s in r["steps"]:
-            for react in s["reactants"]:
-                if react not in all_products:
-                    starting_materials.add(react)
-
-    return {
-        "ok": True,
-        "target": smiles,
-        "routes": routes,
-        "starting_materials": sorted(starting_materials),
-        "purchasable": sorted(purchasable or []),
-        "required_materials": sorted(required_materials or []),
-        "filtered_out": filtered_out,
-        "value_fn": value_fn,
-        "stats": {
-            "or_nodes": len(or_nodes),
-            "and_nodes": len(and_nodes),
-            "expansions": len(and_nodes),
-            "max_heavy_atoms": max_heavy_atoms,
-        },
-        "search_seconds": round(search_s, 1),
-    }
+# --------------------------------------------------------------------------
+# 路线搜索：**单一来源在 model_runtime.run_retro_search**
+# --------------------------------------------------------------------------
+# 🔴 搜索必须复用**已经加载的那一份模型**（一份连带规则子进程约 18GB），
+#    所以它只能在模型服务进程里跑。API 侧一律经 `_model_service.search()` 转接。
+#    从前这里有一份 run_retro_search 的完整拷贝 + `get_model(key)` 就地加载 ——
+#    那会让 API 进程也载一份模型（内存翻倍），而且 API 进程是多线程的，
+#    在里面 spawn 规则子进程会死锁。
 
 
 @app.route("/api/search", methods=["POST"])
@@ -1831,180 +1415,124 @@ def api_search():
 
     try:
         t0 = time.time()
-        model = get_model(model_key)
-        load_s = time.time() - t0
-
-        result = run_retro_search(
-            model,
-            smiles=smiles,
-            max_routes=max_routes,
-            max_calls=max_calls,
-            time_limit=time_limit,
-            max_depth=max_depth,
-            max_heavy_atoms=max_heavy_atoms,
-            value_fn=value_fn,
-            purchasable=purchasable,
-            required_materials=required,
+        # 🔴 搜索一律转接到模型服务（复用那份已加载的模型，本进程不载第二份）。
+        #    这里传 model 进去是为了让「未就绪 / 加载的是别的模型」能给出明确报错。
+        result = search_remote(
+            {
+                "smiles": smiles,
+                "model": model_key,
+                "max_routes": max_routes,
+                "max_calls": max_calls,
+                "time_limit": time_limit,
+                "max_depth": max_depth,
+                "max_heavy_atoms": max_heavy_atoms,
+                "value_fn": value_fn,
+                "purchasable": purchasable,
+                "required_materials": required,
+            }
         )
-        # 同步接口补上 model / load_seconds（异步 job 的 result 由 runner 统一补元信息）
+        # 同步接口补上 model（异步 job 的 result 由 runner 统一补元信息）
         result["model"] = model_key
-        result["load_seconds"] = round(load_s, 1)
         return jsonify(result)
     except Exception as e:  # noqa: BLE001
         traceback.print_exc()
         return jsonify({"ok": False, "error": f"{type(e).__name__}: {e}"}), 500
 
 
-def _preload_model_in_main_thread() -> None:  # pragma: no cover - 已废弃
-    """⚠️ 已废弃，保留仅为兼容旧调用点。
+# --------------------------------------------------------------------------
+# 启动
+# --------------------------------------------------------------------------
+def _autostart_model_service() -> None:
+    """**后台**把模型服务拉起来 —— 本函数绝不阻塞 API 启动。
 
-    历史：曾用「主线程预加载 + 热身推理」来绕开 Windows spawn 死锁。实测证明这不够 ——
-    spawn 在**多线程进程**里同样会死锁（Flask 一跑起来就有 serve 线程）。
-    现在模型整体搬进独立 worker 进程（见 `model_worker_main` / `predict_remote`），
-    Flask 本进程永不 spawn，因此这个函数不再需要做任何事。
-    真正的预加载发生在 `main()` 里启动 worker 进程的那一段。
+    这是「模型后启动」的落点：API 先就绪，模型才开始慢慢加载。
+    这段时间前端照常能用解析 / 绘制 / AI 分析，并轮询 /api/models 看加载进度。
     """
-    return
+    flag = os.environ.get("RETRO_AUTOSTART_MODEL", "1").strip().lower()
+    if flag in ("0", "false", "no", "off"):
+        print("[app] 已关闭模型自动启动（RETRO_AUTOSTART_MODEL=0）", flush=True)
+        return
 
+    target = str(os.environ.get("RETRO_PRELOAD") or "").strip()
+    if target.lower() in ("none", "0", "false", "off"):
+        print("[app] RETRO_PRELOAD=none —— 不自动加载模型", flush=True)
+        return
+    if not target or target not in MODELS:
+        target = next((m["key"] for m in models_catalog() if m["exists"]), "")
+    if not target:
+        print("[app] models/ 目录里没有可用模型，跳过自动加载", flush=True)
+        return
 
-class _MainThreadExecutor(concurrent.futures.Executor):
-    """🔴 把任务调度回**主线程**执行的执行器（解决 Windows spawn 死锁）。
+    def _work() -> None:
+        try:
+            st = _model_service.ensure(target, wait=8.0)
+            if st.get("running"):
+                print(
+                    f"[app] 模型服务已在运行（模型「{st.get('model') or '?'}」，"
+                    f"状态 {st.get('state')}）",
+                    flush=True,
+                )
+            elif st.get("state") == "loading":
+                print(f"[app] 模型服务已在加载「{st.get('model') or target}」", flush=True)
+            else:
+                print("[app] 模型服务已拉起（在独立窗口里，模型正在加载）", flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(
+                f"[app] 注意：模型服务启动失败（{type(e).__name__}: {e}）"
+                "—— 预测不可用，其余功能正常",
+                flush=True,
+            )
 
-    用法：
-        - Flask 在独立后台线程里 `app.run()`，照常接请求、照常把 job 提交进来；
-        - 真正跑预测（会 spawn 规则子进程）的 `_run` 被放进队列，
-          由**主线程**的 `pump()` 逐个取出执行 —— 所以 spawn 永远发生在主线程，
-          不会触发「非主线程 spawn 死锁」。
-        - 主线程同一时刻只跑一个 job（等价于 max_workers=1），与原来串行语义一致；
-          GET /api/jobs 由 Flask 请求线程并发响应（只读 job 状态，不阻塞）。
-
-    这样即便 `RETRO_PRELOAD=none` 关闭了启动预加载，首个 job 也会在主线程里
-    加载模型（spawn 安全），而不是在 Flask 工作线程里卡死。
-    """
-
-    def __init__(self) -> None:
-        self._q: "queue.Queue[tuple]" = queue.Queue()
-        self._shutdown_flag = False
-
-    def submit(self, fn, *args, **kwargs):  # type: ignore[override]
-        fut: concurrent.futures.Future = concurrent.futures.Future()
-        self._q.put((fut, fn, args, kwargs))
-        return fut
-
-    def pump(self) -> None:
-        """主线程永远在这个循环里：取出任务、在主线程执行、回填结果。"""
-        while True:
-            item = self._q.get()
-            if item is None:
-                break
-            fut, fn, args, kwargs = item
-            try:
-                fut.set_result(fn(*args, **kwargs))
-            except Exception as e:  # noqa: BLE001
-                fut.set_exception(e)
-
-    def shutdown(self, wait: bool = False, cancel_futures: bool = False) -> None:  # type: ignore[override]
-        self._q.put(None)
+    threading.Thread(target=_work, name="model-autostart", daemon=True).start()
 
 
 def main():
-    global _REQ_Q, _RESP_Q, _WORKER_FAILED
-    import multiprocessing
-
     port = int(os.environ.get("RETRO_PORT", "8000"))
     host = "127.0.0.1"
     print("=" * 68, flush=True)
-    print("  RetroChimera 本地网页版 —— 逆合成预测 + 合成路径搜索", flush=True)
+    print("  RetroChimera API —— 逆合成预测 + 合成路径搜索", flush=True)
     print("=" * 68, flush=True)
 
-    # 🔴 把任务的真正执行（会 spawn 规则子进程）调度回主线程，避免 Windows 死锁
+    # 🔴 任务中心：预测/搜索现在都是 HTTP 转发（纯 IO 阻塞，本进程不再 spawn），
+    #    用普通的单线程池就够。从前那个「把任务调度回主线程」的 _MainThreadExecutor
+    #    是为了绕开 Windows spawn 死锁 —— 模型搬出去之后它就没有存在意义了。
     if jobhub is not None:
-        _mt_executor = _MainThreadExecutor()
-        jobhub.set_executor(_mt_executor)
-    else:
-        _mt_executor = None
+        jobhub.set_executor(
+            concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="retrojob")
+        )
+        print("[app] ✓ 任务中心已装配", flush=True)
 
-    # 🔴 启动独立的单线程模型 worker 进程（在其中 spawn 规则子进程，安全）。
-    #    Flask 本进程永不 spawn，彻底绕开「多线程进程里 spawn 死锁」。
-    model_key = str(os.environ.get("RETRO_PRELOAD", "pistachio"))
-    if model_key.lower() in ("", "none", "0", "false"):
-        model_key = "pistachio"
-    _REQ_Q = multiprocessing.Queue()
-    _RESP_Q = multiprocessing.Queue()
-    # 🔴 必须是**非 daemon** 进程：worker 内部要 spawn 规则子进程，而 daemon 进程
-    #    在 Python 里禁止有子进程（会抛 AssertionError: daemonic processes are not
-    #    allowed to have children）。worker 由「仍是单线程」的主进程 spawn，安全；
-    #    退出时由 _stop_worker() 显式回收（而非依赖 daemon 自动随父退出）。
-    worker = multiprocessing.Process(
-        target=model_worker_main, args=(_REQ_Q, _RESP_Q, model_key)
-    )
-    print(f"[app] 正在启动独立模型进程（加载「{model_key}」，首次约需 40~90 秒）……", flush=True)
-    worker.start()
-
-    # 阻塞等 worker 回 ready（worker 在单线程里加载模型 + spawn，安全）
-    try:
-        msg = _RESP_Q.get(timeout=float(os.environ.get("RETRO_WORKER_TIMEOUT", "900")))
-    except Exception:  # noqa: BLE001
-        msg = {}
-    if msg.get("type") == "ready":
-        if msg.get("error"):
-            _WORKER_FAILED = True
-            print(f"[app] ✕ 模型进程启动失败：{msg['error']}", flush=True)
-            if msg.get("traceback"):
-                print(msg["traceback"], flush=True)
-        else:
-            _WORKER_READY.set()
-            print("[app] ✓ 模型进程已就绪，可立即接受预测。", flush=True)
-    else:
-        print("[app] ✕ 模型进程返回了意外消息，预测将不可用。", flush=True)
-        _WORKER_FAILED = True
-
-    # 🔴 主线程要跑预测任务（validate/predict），会用到大库 rdkit；
-    #    在正式接请求之前预热一次，避免首个 job 在请求线程里临时 import rdkit
-    #    拖慢甚至饿死 GET /api/jobs 轮询（rdkit import 在首次调用时约需数秒）。
+    # rdkit 预热：/api/parse、/api/depict、目标分子校验都要用
     try:
         import rdkit  # noqa: F401
 
-        print("[app] ✓ rdkit 已预热（主线程预测路径不再临时 import）", flush=True)
+        print("[app] ✓ rdkit 已预热", flush=True)
     except Exception as e:  # noqa: BLE001
-        print(f"[app] 注意：rdkit 预热失败（{e}），首个 job 会临时 import", flush=True)
+        print(f"[app] 注意：rdkit 预热失败（{e}），首次解析会慢一点", flush=True)
 
-    print(f"  请在浏览器打开:  http://{host}:{port}", flush=True)
-    print("  按 Ctrl+C 停止服务（会自动回收规则子进程，退出时的红色", flush=True)
-    print("  BrokenPipeError traceback 属于正常现象，不影响任何功能）", flush=True)
+    # 🔴 模型服务**后台**拉起 —— 绝不阻塞。API 立刻就绪，模型慢慢加载。
+    _autostart_model_service()
+
+    print("", flush=True)
+    print(f"  API 已就绪:  http://{host}:{port}", flush=True)
+    print(f"  模型服务:    http://127.0.0.1:{_model_service.port}（在另一个窗口）", flush=True)
+    print("  前端在 retroweb 仓库（npm run dev，端口 5177）", flush=True)
+    print("", flush=True)
+    print("  按 Ctrl+C 停止 API。模型服务是**常驻**的，默认不跟着退 ——", flush=True)
+    print("  这样你重启 API 时模型不用重载。想一起停就设", flush=True)
+    print("  RETRO_MODEL_STOP_WITH_API=1。", flush=True)
     print("=" * 68, flush=True)
 
-    # Flask 在独立后台线程里跑，主线程专门 pump 任务队列（预测永远在主线程经队列转发）
-    flask_thread = threading.Thread(
-        target=lambda: app.run(host=host, port=port, debug=False, threaded=True),
-        name="flask-serve",
-        daemon=True,
-    )
-    flask_thread.start()
-
-    if _mt_executor is not None:
-        try:
-            _mt_executor.pump()  # 主线程永远在这里：逐个执行预测任务
-        except KeyboardInterrupt:
-            pass
-        finally:
-            _stop_worker(worker)
-            _shutdown_workers()
-            print("[app] 服务已停止（子进程已回收）", flush=True)
-    else:
-        # 任务中心不可用：主线程空转，等 Flask 线程结束
-        try:
-            flask_thread.join()
-        except KeyboardInterrupt:
-            pass
-        finally:
-            _stop_worker(worker)
-            _shutdown_workers()
+    # 模型已不在本进程，不需要主线程 pump ⇒ Flask 直接在主线程跑
+    try:
+        app.run(host=host, port=port, debug=False, threaded=True)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        _model_service.shutdown_if_owned()
+        print("[app] API 服务已停止", flush=True)
 
 
 if __name__ == "__main__":
-    from multiprocessing import freeze_support
-
-    freeze_support()
     _install_exit_hooks()
     main()

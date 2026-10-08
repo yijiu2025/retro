@@ -204,11 +204,28 @@ def _max_tokens_in(raw) -> int:
     return min(1_000_000, max(16, v))
 
 
-def _tokens_hint(cfg: dict) -> str:
-    """截断报错的「怎么调」完整从句。max_tokens=0（无限制）时不能说「当前 0，请调大」。
+class LlmConfigError(RuntimeError):
+    """配置本身就不可能跑通。
 
-    无限制下仍被截断 ⇒ 撞的是**模型/网关自身的上下文上限**，本侧改 max_tokens 无效，
-    得换更长上下文的模型或网关侧放宽，所以提示文案要换一套。
+    与「网络故障 / 额度用尽 / 模型不可用」区分开：这一类改配置即可，重试多少次都一样。
+    """
+
+
+# 🔴 输出额度的**可用下限**（token）。低于它的值不是「省 token」，是「必然一个字都出不来」：
+#    推理模型的思考 token 也计入这个额度 —— 实测一次候选条件枚举，光思考就吐了 9288 字符，
+#    16 个 token 连思考都开不了头。`_max_tokens_in` 的**格式下限 16 挡不住这种情况**
+#    （16 本身就在坏区间里），所以另设一道「可用性」门槛，在**发请求之前**就拦掉，
+#    别让用户白等一整轮（那次要等思考跑完才报出「截断」）。
+MT_MIN_USABLE = 1024
+
+
+def _tokens_hint(cfg: dict) -> str:
+    """截断报错的「怎么调」完整从句。
+
+    🔴 必须区分 max_tokens 的**生效来源**：它可能来自「端点配置」(llm_settings.json)、
+       老式顶层扁平字段、或 web/.env。优先级是 profile > 顶层 > .env —— 所以当生效值
+       来自 profile 时，让用户去改 .env 是**永远无效的指引**（实测：.env 里写着 32768、
+       界面上这套是 16，用户照文案反复改 .env 只是白忙一场）。
     """
     mt = cfg.get("max_tokens")
     if not mt:
@@ -216,7 +233,29 @@ def _tokens_hint(cfg: dict) -> str:
             "当前输出上限为「无限制」（不传 max_tokens），仍被截断说明撞到了模型/网关"
             "自身的上下文上限 —— 请换一个上下文更长的模型，或联系网关方放宽上限"
         )
-    return f"请调大 .env 里的 RETRO_LLM_MAX_TOKENS（当前 {mt}）"
+    if cfg.get("max_tokens_source") in ("profile", "settings"):
+        return (
+            f"请在「运行参数 → 大模型设置 → 端点配置」里，把当前这套配置的「输出上限」"
+            f"改大（当前 {mt}），或勾上「无限制」"
+        )
+    return f"请调大 web/.env 里的 RETRO_LLM_MAX_TOKENS（当前 {mt}）"
+
+
+def _tiny_tokens_text(cfg: dict) -> str:
+    """额度小到不可能出正文时的报错文案；返回 "" = 没问题。
+
+    🔴 为什么要**前置**拦：额度不够的表现是「静默截断」—— 用户在流式面板上只看到思考
+       在滚、正文一直不出来，等到最后才收到一条「被截断」。等它等到那一刻，一整轮已经过去了。
+       这里在发请求前就直说，并一并给出「去哪改」。
+    """
+    mt = int(cfg.get("max_tokens") or 0)
+    if not mt or mt >= MT_MIN_USABLE:
+        return ""
+    model = cfg.get("model") or "当前模型"
+    return (
+        f"输出上限只有 {mt} 个 token —— 推理模型（{model}）的思考 token 也记在这个额度里，"
+        f"思考还没结束额度就用光了，正文一个字都出不来。{_tokens_hint(cfg)}"
+    )
 
 
 def _float_in(raw, default: float, lo: float, hi: float) -> float:
@@ -598,6 +637,18 @@ def config() -> dict:
             v = os.environ.get(f"RETRO_LLM_{name.upper()}")
         return v
 
+    def _raw_src(name: str) -> str:
+        """同 `_raw`，但回的是**生效来源**：`profile` / `settings` / `env`。
+
+        🔴 报错文案要靠它决定「让用户去哪改」—— 指错地方比不指还糟：用户会照着反复改
+           一个**被上层盖掉**的地方，看什么都没变。
+        """
+        if prof.get(name) not in (None, ""):
+            return "profile"
+        if ov.get(name) not in (None, ""):
+            return "settings"
+        return "env"
+
     def _num(name: str, env_default: str, cast, lo: float, hi: float):
         raw = _raw(name)
         if raw is None or raw == "":
@@ -623,6 +674,9 @@ def config() -> dict:
         "timeout": _num("timeout", "180", float, 5.0, 3600.0),
         # 0 = 无限制（不设上限，交给模型默认）；非 0 走 [16, 1_000_000] clamp
         "max_tokens": _max_tokens_in(_raw("max_tokens")),
+        # 🔴 生效来源：截断报错要靠它说清「去哪改」（见 _tokens_hint）。profile 会盖掉 .env，
+        #    所以「来自 profile」时提示 .env 是无效指引。
+        "max_tokens_source": _raw_src("max_tokens"),
         "json_mode": _flag("json_mode", "1"),
         "temperature": _num("temperature", "0.3", float, 0.0, 2.0),
     }
@@ -1551,6 +1605,11 @@ def _body(cfg: dict, messages: list, stream: bool, json_mode: Optional[bool] = N
     #    输出额度里**（实测 max_tokens=8 时思考就吃光、正文一个字都没有、finish_reason=length）。
     #    额度太小 ⇒ 返回被静默截断 ⇒ JSON 抽不出来，报错还看不出是截断导致的。
     #    max_tokens=0 表示「无限制」：用户显式选了不设上限，这里就不发字段、交给模型默认。
+    tiny = _tiny_tokens_text(cfg)
+    if tiny:
+        # 🔴 发请求前就拦：这种额度必然连思考都用不完，发出去只是让用户白等一整轮
+        #    再收到一条「被截断」（更糟的是它看起来像网络/模型故障）。
+        raise LlmConfigError(tiny)
     if cfg.get("max_tokens"):
         body["max_tokens"] = int(cfg["max_tokens"])
     # 🔴 json_mode 显式传 False 时必须**覆盖**配置里的 json_mode：追问要的是自由文本回答，
@@ -1635,6 +1694,10 @@ def analyze(req: dict) -> dict:
             accept="application/json",
             tried=tried,
         )
+    except LlmConfigError as e:
+        # 配置本身跑不通（例如输出额度小到出不来正文）—— 直接把文案交给上层，
+        # 别落进下面「瞬时网络故障」那个分支被当成网络问题去重试。
+        raise RuntimeError(str(e)) from e
     except MultiKeyError as e:
         raise RuntimeError(str(e)) from e
     except Exception as e:  # noqa: BLE001
@@ -1794,6 +1857,10 @@ def stream_analyze(req: dict) -> Iterator[str]:
                 "finish_reason": finish_reason,
             }
         )
+    except LlmConfigError as e:
+        # 配置本身跑不通 ⇒ 原样下发（不加 `LlmConfigError: ` 这种类名前缀，用户不需要看类名）
+        yield sse({"type": "error", "error": str(e)})
+        return
     except Exception as e:  # noqa: BLE001
         # 瞬时网络故障（TLS 被掐 / 代理端口失效 / 读半截）翻成人话，别甩一个
         # SSLEOFError 让用户猜 —— 实测这类错误重发就好，指引里直接给开关。
@@ -2076,6 +2143,9 @@ def stream_conditions(req: dict) -> Iterator[str]:
                 "finish_reason": finish_reason,
             }
         )
+    except LlmConfigError as e:
+        yield sse({"type": "error", "error": str(e)})
+        return
     except Exception as e:  # noqa: BLE001
         if _is_transient(e):
             yield sse({"type": "error", "error": network_error_text(e, tried, cfg["base_url"])})
@@ -2255,6 +2325,9 @@ def stream_followup(req: dict) -> Iterator[str]:
                 "finish_reason": finish_reason,
             }
         )
+    except LlmConfigError as e:
+        yield sse({"type": "error", "error": str(e)})
+        return
     except Exception as e:  # noqa: BLE001
         if _is_transient(e):
             yield sse({"type": "error", "error": network_error_text(e, tried, cfg["base_url"])})
