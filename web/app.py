@@ -35,6 +35,7 @@ if os.path.isdir(_BIN_DIR):
     except Exception:  # noqa: BLE001
         pass
 
+import json
 import threading
 import time
 import traceback
@@ -649,6 +650,8 @@ _API_INDEX = {
         {"method": "POST", "path": "/api/llm/analyze/stream", "desc": "工艺分析（SSE 流式）"},
         {"method": "POST", "path": "/api/llm/conditions/stream", "desc": "候选反应条件枚举（SSE；先选条件再深入分析）"},
         {"method": "POST", "path": "/api/llm/followup/stream", "desc": "工艺分析追问（SSE，携带上下文自由回答）"},
+        {"method": "POST", "path": "/api/feedback", "desc": "记录一条「预测 vs 实测」反馈（落盘 feedback.jsonl 供训练）"},
+        {"method": "GET", "path": "/api/feedback", "desc": "读回已收集的反馈（供导出/查看）"},
     ],
 }
 
@@ -1284,6 +1287,111 @@ def api_llm_followup_stream():
         mimetype="text/event-stream",
         headers=headers,
     )
+
+
+# --------------------------------------------------------------------------
+# 错误反馈学习 —— 用户做实验后发现预测与实际偏差较大，通过反馈把「预测值 vs 实测值」
+# 沉淀下来，供后续微调 / 蒸馏训练使用。
+#
+# 数据落盘到 <web>/data/feedback.jsonl，每行一条 JSON（JSON Lines，方便逐条喂训练）。
+# 设计约定见仓库里的「反馈学习机制」文档。
+# --------------------------------------------------------------------------
+_FEEDBACK_DIR = os.path.join(HERE, "data")
+_FEEDBACK_PATH = os.path.join(_FEEDBACK_DIR, "feedback.jsonl")
+_FEEDBACK_LOCK = threading.Lock()
+
+# 反馈体里允许出现的字段 → 落盘前的白名单 + 截断上限。🔴 不白名单 = 任意字段都能
+# 注入，既可能撑爆文件，也可能混进不可信内容污染训练集。
+_FEEDBACK_FIELDS = {
+    "kind": 32,            # 反馈类型：tlc（点板/过柱）/ yield（收率）/ condition（条件）…
+    "target": 256,         # 目标分子 SMILES（可选，整条路线上下文）
+    "product": 256,        # 这一步产物 SMILES
+    "precursors": 1024,    # 前体 SMILES，逗号分隔
+    "reaction_id": 128,    # 这一步反应 id（前端确定性 reactionId）
+    "model": 64,           # 预测用的模型名
+    "predicted": 4096,     # 预测内容（Rf 范围、洗脱剂、收率…）
+    "observed": 4096,      # 实测结果（用户实验后填的）
+    "delta_note": 4096,    # 用户对「差异多大、为什么差」的自由描述
+    "module": 32,          # 对应哪个分析模块（tlc/outcome/conditions…）
+}
+_FEEDBACK_LIST_FIELDS = ("precursors",)  # 需要拆成列表的字段
+
+
+def _sanitize_feedback(data: dict) -> dict | None:
+    """白名单 + 截断 + 补时间戳。返回 None 表示没有可落盘的字段。"""
+    if not isinstance(data, dict) or not data:
+        return None
+    out: dict = {}
+    for key, limit in _FEEDBACK_FIELDS.items():
+        val = data.get(key)
+        if val is None:
+            continue
+        if key in _FEEDBACK_LIST_FIELDS:
+            items = val if isinstance(val, list) else [val]
+            cleaned = [str(x).strip()[:limit] for x in items if str(x).strip()]
+            if cleaned:
+                out[key] = cleaned
+            continue
+        s = str(val).strip()
+        if s:
+            out[key] = s[:limit]
+    # 一条反馈至少要能说明「预测了什么、实测是什么」才有训练价值
+    if not out.get("predicted") and not out.get("observed"):
+        return None
+    out["at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    return out
+
+
+@app.route("/api/feedback", methods=["POST"])
+def api_feedback():
+    """接收一条「预测 vs 实测」反馈，追加到 feedback.jsonl。
+
+    请求体：{ kind?, target?, product?, precursors?, reaction_id?, model?,
+              predicted?, observed?, delta_note?, module? }
+    全部可选，但 predicted / observed 至少要给一个，否则 400。
+
+    🔴 不依赖大模型模块：即使 llm 未配置，反馈收集也要能用（用户实验反馈与 AI 无关）。
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    cleaned = _sanitize_feedback(data)
+    if cleaned is None:
+        return jsonify({"ok": False, "error": "至少需要 predicted 或 observed 之一"}), 400
+    try:
+        os.makedirs(_FEEDBACK_DIR, exist_ok=True)
+        line = json.dumps(cleaned, ensure_ascii=False)
+        with _FEEDBACK_LOCK:
+            with open(_FEEDBACK_PATH, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+    except OSError as e:  # noqa: BLE001
+        return jsonify({"ok": False, "error": f"写入反馈失败：{e}"}), 500
+    return jsonify({"ok": True, "saved": cleaned["at"]})
+
+
+@app.route("/api/feedback", methods=["GET"])
+def api_feedback_list():
+    """读回已收集的反馈（供前端导出 / 用户查看），带条数上限，避免一次性吐全量。"""
+    limit = request.args.get("limit", "200")
+    try:
+        limit = max(1, min(1000, int(limit)))
+    except (TypeError, ValueError):
+        limit = 200
+    if not os.path.exists(_FEEDBACK_PATH):
+        return jsonify({"ok": True, "count": 0, "items": []})
+    items: list = []
+    try:
+        with open(_FEEDBACK_PATH, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        for raw in lines[-limit:]:
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                items.append(json.loads(raw))
+            except json.JSONDecodeError:
+                continue
+    except OSError as e:  # noqa: BLE001
+        return jsonify({"ok": False, "error": f"读取反馈失败：{e}"}), 500
+    return jsonify({"ok": True, "count": len(items), "items": items})
 
 
 def validate_target_smiles(smiles: str):

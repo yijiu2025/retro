@@ -1127,6 +1127,16 @@ def _one_mass(smiles: str) -> dict:
         if mol is None:
             return {"smiles": smiles, "ok": False, "error": "RDKit 无法解析"}
         exact = float(Descriptors.ExactMolWt(mol))
+        # 极性相关确定性数值（点板 / 过柱模块的输入）：logP、氢键供体/受体、极性表面积、可旋转键。
+        # 这些值**由 RDKit 算**，模型只做解读（估 Rf / 洗脱剂），不让它自己瞎猜数值。
+        try:
+            logp = round(float(Descriptors.MolLogP(mol)), 2)
+        except Exception:  # noqa: BLE001
+            logp = None
+        try:
+            tpsa = round(float(rdMolDescriptors.CalcTPSA(mol)), 1)
+        except Exception:  # noqa: BLE001
+            tpsa = None
         return {
             "smiles": smiles,
             "ok": True,
@@ -1137,6 +1147,13 @@ def _one_mass(smiles: str) -> dict:
             "mz_neg": round(exact - _PROTON, 4),        # [M-H]-
             "mz_na": round(exact + _SODIUM, 4),         # [M+Na]+
             "heavy_atoms": int(mol.GetNumHeavyAtoms()),
+            # 点板 / 过柱极性
+            "logp": logp,
+            "tpsa": tpsa,
+            "hbd": int(rdMolDescriptors.CalcNumHBD(mol)),
+            "hba": int(rdMolDescriptors.CalcNumHBA(mol)),
+            "rotatable": int(rdMolDescriptors.CalcNumRotatableBonds(mol)),
+            "aromatic_rings": int(rdMolDescriptors.CalcNumAromaticRings(mol)),
         }
     except Exception as e:  # noqa: BLE001
         return {"smiles": smiles, "ok": False, "error": f"{type(e).__name__}: {e}"}
@@ -1214,10 +1231,20 @@ JSON 结构（字段必须齐全，值可以为空字符串或空数组）：
   "byproducts": [{"name": "副产物名", "source": "生成的机理来源", "mz": "该副产物 [M+H]+ 近似 m/z", "control": "如何抑制/如何识别"}],
   "lcms": {"mz_theoretical": "主产物理论 m/z", "adduct": "[M+H]+", "note": "保留时间趋势 / 特征碎片 / 与副产物的区分"},
   "nmr": {"h1": "重要 1H NMR 归属（给化学位移与裂分，例如 7.9 (d, 2H)）", "c13": "重要 13C 位移", "note": "判据与注意点"},
+  "tlc": {
+    "rf_est": "产物在硅胶板上的估算 Rf 范围，如 0.3~0.5（注明展开剂，如 PE:EA=4:1）；给出依据（logP / 极性基团）",
+    "eluent": "柱层析洗脱剂系统与梯度，如 先用 PE 冲掉低极性杂质，再用 PE:EA=10:1→4:1 梯度；给体积比",
+    "polarity_order": "产物与各前体/杂质的极性从低到高排序，说明为什么这么排（logP/氢键/极性基团）",
+    "spotting": "点板判据：怎么判断反应完成、怎么区分产物点与前体残留点（显色/紫外/碘缸等）",
+    "note": "过柱注意点（拖尾、是否加酸/碱改性、吸附损失、Rf 过低/过高的处理）"
+  },
   "safety": ["安全与放大提示"],
   "confidence": 0.0
 }
-`confidence` 是 0~1 的数，表示你对这份分析整体的把握。"""
+`confidence` 是 0~1 的数，表示你对这份分析整体的把握。
+
+关于 `tlc`（点板 / 过柱极性预测）：产物与各前体的 logP / TPSA / 氢键供受体数由 RDKit 算好放在上下文里，
+你**直接引用这些数值**做解读，不要另造数值；Rf 与洗脱剂是经验估计，给范围而非精确值，并说清依据。"""
 
 # 前端可勾选的「分析模块」→ JSON 字段。`name` 是前端传的 key，`desc` 用于生成精简版 system。
 # 🔴 顺序即展示顺序，别乱动；`fields` 里是**该模块在 JSON 里对应的顶层字段**。
@@ -1231,6 +1258,7 @@ _MODULE_FIELDS = {
     "byproducts": {"fields": ["byproducts"], "desc": "可能的副产物（名称/来源机理/mz/控制方式）"},
     "lcms": {"fields": ["lcms"], "desc": "LCMS 解读（保留时间趋势/特征碎片/与副产物区分；m/z 数值已由 RDKit 算好，直接引用）"},
     "nmr": {"fields": ["nmr"], "desc": "NMR 谱图归属（1H/13C 位移与裂分/判据）"},
+    "tlc": {"fields": ["tlc"], "desc": "点板与过柱极性预测（估算 Rf/洗脱剂梯度/极性排序/点板判据；logP/TPSA 已由 RDKit 算好，直接引用）"},
     "safety": {"fields": ["safety"], "desc": "安全与放大提示"},
 }
 
@@ -1274,10 +1302,16 @@ def _build_system(modules: list[str] | None, extra_note: str = "") -> str:
 def _fmt_mass_row(r: dict) -> str:
     if not r.get("ok"):
         return f"- {r.get('smiles')}（无法解析）"
-    return (
+    base = (
         f"- {r['smiles']}　分子式 {r.get('formula')}　MW {r.get('mw')}　"
         f"精确质量 {r.get('exact_mass')}　[M+H]+ {r.get('mz_pos')}　[M-H]- {r.get('mz_neg')}"
     )
+    # 极性相关数值（点板/过柱模块用）：logP / TPSA / 氢键供受体 / 可旋转键 / 芳环数
+    polarity = (
+        f"　logP {r.get('logp')}　TPSA {r.get('tpsa')}　"
+        f"HBD {r.get('hbd')} HBA {r.get('hba')}　可旋转键 {r.get('rotatable')}　芳环 {r.get('aromatic_rings')}"
+    )
+    return base + polarity
 
 
 # 候选条件方案里要在 prompt 中回述的字段（顺序即展示顺序）。
