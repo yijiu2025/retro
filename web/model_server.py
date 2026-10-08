@@ -38,6 +38,16 @@ API 重启时若探测到本服务还活着，就直接复用 —— 模型**不
     set RETRO_PRELOAD=uspto50k && python web/model_server.py
     set RETRO_MODEL_PORT=8011 && python web/model_server.py
 
+正向模型（「可行性过滤」的判据）默认不加载，按需挂：
+
+    POST /forward/load      {"forward": "forward_pistachio"}   # 立即返回，进度看 /status
+    POST /forward/unload                                        # 省内存时卸掉
+    set RETRO_PRELOAD_FORWARD=forward_pistachio && python web/model_server.py   # 开机就绪
+
+🔴 正向模型与逆向模型的生命周期**不同**：换逆向模型要重启本进程（它构造时要 spawn
+规则子进程，Windows 下必须在单线程阶段完成），而正向模型是纯 transformer、构造时
+不 spawn ⇒ 可以在 HTTP 起来之后随时热挂，不用重启。
+
 通常不用手动跑 —— API 服务（`启动后端API.bat`）会按需拉起并复用本服务。
 """
 from __future__ import annotations
@@ -96,6 +106,9 @@ def _write_state(**extra) -> None:
         "phase": host.phase,
         "error": host.error,
         "load_seconds": host.load_seconds,
+        # 正向模型（可行性过滤用）的状态也要落盘：它可以在 HTTP 起来之后热挂，
+        # 前端轮询走 /api/models（HTTP），但进程重启/崩溃后这份记录是唯一线索。
+        "forward": host.forward_status(),
         "started_at": _started_at,
         "updated_at": time.time(),
     }
@@ -242,6 +255,9 @@ def search():
     allowed = (
         "smiles", "max_routes", "max_calls", "time_limit", "max_depth",
         "max_heavy_atoms", "value_fn", "purchasable", "required_materials",
+        # 可行性过滤（正向模型当判据）。forward_model **不在**白名单里：
+        # 那个对象常驻在本进程，由 host.search() 自己注入，客户端不该也无法指定。
+        "use_forward_filter", "forward_top_k",
     )
     params = {k: v for k, v in data.items() if k in allowed}
     try:
@@ -250,6 +266,63 @@ def search():
         if host.state == "ready":
             traceback.print_exc()
         return _infer_error(e)
+
+
+# --------------------------------------------------------------------------
+# 正向模型（可行性过滤的判据）—— 可热挂，不需要重启本进程
+# --------------------------------------------------------------------------
+# 🔴 为什么它跟逆向模型不一样、能热挂：
+#    换逆向模型 = 重启进程，是因为它构造时要 spawn 规则子进程，而 Windows 的 spawn
+#    在多线程进程里会死锁（必须在单线程阶段加载）。正向模型是个纯 transformer，
+#    构造时不 spawn（唯一用到 multiprocessing 的地方在推理时，与逆向模型共用同一套
+#    已经跑通的写法）—— 所以它可以随时加载，代价只有几十秒和约 1 GB 内存。
+@app.route("/forward/load", methods=["POST"])
+def forward_load():
+    """加载正向模型（幂等）。**立即返回**，进度看 /status 或 /api/models。
+
+    body: {"forward": "forward_pistachio"}（不传则用 RETRO_PRELOAD_FORWARD，
+          再退到注册表里第一个）
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    key = str(data.get("forward") or "").strip() or model_runtime.default_forward_key()
+    if not key:
+        key = next(iter(model_runtime.FORWARD_MODELS), "")
+    if key not in model_runtime.FORWARD_MODELS:
+        return jsonify({"ok": False, "error": f"未知正向模型: {key or '(空)'}"}), 400
+
+    if host.forward_state == "loading":
+        return jsonify({"ok": True, "started": True, "already": True, **host.forward_status()})
+    if host.forward_state == "ready" and host.forward_key == key:
+        return jsonify({"ok": True, "started": False, "already": True, **host.forward_status()})
+
+    # 🔴 先置 loading 再起线程：反过来的话，前端拿到响应立刻轮询时线程可能还没跑起来，
+    #    看到的仍是 idle ⇒ 按钮"点了没反应"，而其实正在加载。
+    host.forward_state = "loading"
+    host.forward_key = key
+
+    def _load() -> None:
+        try:
+            host.load_forward(key, on_phase=lambda text: print(f"[model]   · {text}", flush=True))
+            _write_state()
+            print(
+                f"[model] ✓ 正向模型「{key}」已就绪，用时 {host.forward_load_seconds}s",
+                flush=True,
+            )
+        except Exception:  # noqa: BLE001
+            _write_state()
+            print(f"[model] ✕ 正向模型加载失败：{host.forward_error}", flush=True)
+            traceback.print_exc()
+
+    threading.Thread(target=_load, name="forward-loader", daemon=True).start()
+    return jsonify({"ok": True, "started": True, "key": key, **host.forward_status()})
+
+
+@app.route("/forward/unload", methods=["POST"])
+def forward_unload():
+    """卸载正向模型（省内存）。不影响正在加载 / 已就绪的逆向模型。"""
+    host.unload_forward()
+    _write_state()
+    return jsonify({"ok": True, "unloaded": True, **host.forward_status()})
 
 
 @app.route("/shutdown", methods=["POST"])
@@ -315,6 +388,35 @@ def main() -> None:
             _write_state(traceback=traceback.format_exc())
             print(f"[model] ✕ 加载失败：{host.error}", flush=True)
             traceback.print_exc()
+
+    # ---- 正向模型（可选）----
+    # 🔴 默认**不**预加载：它只服务于「可行性过滤」这一个开关，额外要 ~1 GB 内存。
+    #    要用就 `set RETRO_PRELOAD_FORWARD=forward_pistachio`（或前端点「加载」，
+    #    那条路走 HTTP、不影响本进程的启动顺序）。
+    #    这里仍然在**起 Flask 之前**加载 —— 位置与逆向模型一致，是最安全的阶段。
+    fkey = model_runtime.default_forward_key()
+    if fkey:
+        print(f"[model] 预加载正向模型「{fkey}」（可行性过滤用）……", flush=True)
+        try:
+            host.load_forward(fkey, on_phase=lambda text: print(f"[model]   · {text}", flush=True))
+            _write_state()
+            print(
+                f"[model] ✓ 正向模型「{fkey}」已就绪，用时 {host.forward_load_seconds}s",
+                flush=True,
+            )
+        except Exception:  # noqa: BLE001
+            # 🔴 正向模型加载失败**不能**拖垮整个服务：它只是个可选附件，
+            #    逆向搜索本身照常可用。状态落到 failed，前端会显示原因。
+            host.forward_state = "failed"
+            _write_state()
+            print(f"[model] ✕ 正向模型加载失败（不影响逆向搜索）：{host.forward_error}", flush=True)
+            traceback.print_exc()
+    else:
+        print(
+            "[model] 正向模型未预加载（可行性过滤点按钮时再加载；"
+            "想开机就绪设 RETRO_PRELOAD_FORWARD=forward_pistachio）",
+            flush=True,
+        )
 
     print(f"  状态接口: http://127.0.0.1:{PORT}/status", flush=True)
     print("=" * 68, flush=True)

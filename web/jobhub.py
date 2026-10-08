@@ -579,6 +579,7 @@ def make_search_runner(
     validate_target_smiles: Callable[[str], tuple],
     search_fn: Callable[[dict], dict],
     model_keys: set,
+    forward_check: Callable[[], None] | None = None,
 ) -> Callable[[Job], dict]:
     """构造 /api/jobs(kind=search) 的执行体。与 predict 的 runner 对称。
 
@@ -589,12 +590,19 @@ def make_search_runner(
 
     参数契约与同步 /api/search 一致（见 app.py api_search）：
       params = {smiles, model, max_routes, max_calls, time_limit, max_depth,
-                max_heavy_atoms, value_fn, purchasable, required_materials}
+                max_heavy_atoms, value_fn, purchasable, required_materials,
+                use_forward_filter, forward_top_k}
+
+    `forward_check()`：开启「可行性过滤」前的闸门（见 app._require_forward_ready）。
+      传进来、而不是在 jobhub 里自己判，是为了让「正向模型在不在」只有**一个判据
+      来源** —— 本模块不碰模型服务，也不该自己去读 /status。它抛异常 = 不许开跑。
     """
 
     def runner(job: Job) -> dict:
         smiles = str(job.params.get("smiles") or "").strip()
         model_key = job.params.get("model", "pistachio")
+        use_forward_filter = bool(job.params.get("use_forward_filter"))
+        forward_top_k = int(job.params.get("forward_top_k", 5))
 
         # 1) 校验
         job.begin_stage("validate", "校验分子结构", smiles[:60])
@@ -602,6 +610,9 @@ def make_search_runner(
             raise ValueError("请输入目标分子的结构或 SMILES")
         if model_key not in model_keys:
             raise ValueError(f"未知模型: {model_key}")
+        if use_forward_filter and forward_check is not None:
+            # 🔴 在**开跑之前**判：不拦的话要等搜索整趟跑完才失败，白等。
+            forward_check()
         ok_smi, smiles, err = validate_target_smiles(smiles)
         job.check_cancel()
         if not ok_smi:
@@ -611,6 +622,11 @@ def make_search_runner(
             raise ValueError(job.error)
         job.end_stage(detail=smiles)
         job.log(f"目标分子已规范化：{smiles}", level="info")
+        if use_forward_filter:
+            job.log(
+                f"已开启可行性过滤：候选反应须命中正向模型 top-{forward_top_k}",
+                level="info",
+            )
 
         # 2) 模型跑在**独立常驻服务**里（web/model_server.py），本进程不加载。
         #    🔴 这里以前写「独立进程已预加载，跳过」—— 与 predict runner 同一个谎：
@@ -621,7 +637,10 @@ def make_search_runner(
         # 3) 搜索在**模型服务进程**里跑（HTTP 转接，复用那里已加载的模型）。
         #    search 是唯一的重活，给它 0.92 的权重（validate/post 各占一点）；
         #    load 被 skip 掉不计入分母，所以 search 要拿掉进度条的大头。
-        job.begin_stage("search", "多步路线搜索", "Retro* 广度优先 · 吃满调用预算", weight=0.92)
+        note = "Retro* 广度优先 · 吃满调用预算"
+        if use_forward_filter:
+            note += f" · 正向过滤 top-{forward_top_k}"
+        job.begin_stage("search", "多步路线搜索", note, weight=0.92)
         t1 = time.time()
         result = search_fn(
             {
@@ -635,6 +654,10 @@ def make_search_runner(
                 "value_fn": str(job.params.get("value_fn") or "complexity"),
                 "purchasable": job.params.get("purchasable") or [],
                 "required_materials": job.params.get("required_materials") or [],
+                # 可行性过滤：正向模型对象常驻在模型服务里，由那边按真实状态注入
+                # （见 model_runtime.ModelHost.search）—— 这里只说要不要、top-k 多少。
+                "use_forward_filter": use_forward_filter,
+                "forward_top_k": forward_top_k,
             }
         )
         search_s = time.time() - t1
@@ -646,6 +669,11 @@ def make_search_runner(
         job.begin_stage("post", "整理路线与起始物料", "")
         result.setdefault("ok", True)
         result["search_seconds"] = round(search_s, 1)
+        # 过滤通过率：把「过滤真的在起作用」和「过滤器把一切都放行（等于没开）」
+        # 区分开。缺了它，用户只能看到路线条数变了，猜不出过滤器有没有生效。
+        rate = result.get("acceptance_rate")
+        if result.get("forward_filter") and rate is not None:
+            job.log(f"可行性过滤通过率：{rate * 100:.1f}%", level="info")
         job.end_stage(detail=f"{n_routes} 条路线")
 
         return result

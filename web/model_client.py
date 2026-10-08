@@ -95,6 +95,14 @@ def _http_json(method: str, url: str, body=None, timeout: float = 0.6):
     return json.loads(raw) if raw else {}
 
 
+def _http_detail(e: urllib.error.HTTPError) -> str:
+    """从 HTTPError 的 body 里抠出后端写的人话（没有就退回状态码说明）。"""
+    try:
+        return (json.loads(e.read().decode("utf-8")) or {}).get("error") or ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 class ModelServiceClient:
     """常驻模型服务的客户端。"""
 
@@ -269,18 +277,49 @@ class ModelServiceClient:
         try:
             out = _http_json("POST", f"{self.base}{path}", body=body, timeout=timeout)
         except urllib.error.HTTPError as e:
-            detail = ""
-            try:
-                detail = (json.loads(e.read().decode("utf-8")) or {}).get("error") or ""
-            except Exception:  # noqa: BLE001
-                detail = ""
-            raise RuntimeError(detail or f"模型服务返回 HTTP {e.code}") from e
+            raise RuntimeError(_http_detail(e)) from e
         except urllib.error.URLError as e:
             raise RuntimeError(
                 f"模型服务不可达（{self.base}）—— 它可能没在运行：{e}"
             ) from e
         if not out.get("ok"):
             raise RuntimeError(out.get("error") or "模型服务返回失败")
+        return out
+
+    # ------------------------------------------------------------------
+    # 正向模型（「可行性过滤」的判据）
+    # ------------------------------------------------------------------
+    def load_forward(self, key: str = "", timeout: float = 600.0) -> dict:
+        """请模型服务加载正向模型。**立刻返回受理结果**，进度看 /api/models。
+
+        🔴 与 load() 关键区别：正向模型**不需要重启进程**（它构造时不 spawn 规则
+           子进程 ⇒ 可以在 HTTP 起来之后热挂）。所以这里没有 stop/start 那套，
+           也不存在"重启等于改了没生效"的坑。
+        """
+        try:
+            out = _http_json(
+                "POST", f"{self.base}/forward/load", body={"forward": key or ""}, timeout=timeout
+            )
+        except urllib.error.HTTPError as e:
+            raise RuntimeError(_http_detail(e)) from e
+        except urllib.error.URLError as e:
+            raise RuntimeError(
+                f"模型服务不可达（{self.base}）—— 它可能没在运行：{e}"
+            ) from e
+        if not out.get("ok"):
+            raise RuntimeError(out.get("error") or "加载正向模型失败")
+        return out
+
+    def unload_forward(self, timeout: float = 30.0) -> dict:
+        """卸载正向模型（省内存）。"""
+        try:
+            out = _http_json("POST", f"{self.base}/forward/unload", body={}, timeout=timeout)
+        except urllib.error.HTTPError as e:
+            raise RuntimeError(_http_detail(e)) from e
+        except urllib.error.URLError as e:
+            raise RuntimeError(
+                f"模型服务不可达（{self.base}）—— 它可能没在运行：{e}"
+            ) from e
         return out
 
     def predict(self, smiles: str, num_results: int, timeout: float = 900.0) -> list:
@@ -298,7 +337,7 @@ class ModelServiceClient:
     # ------------------------------------------------------------------
     # 状态矩阵（给 /api/models 用）
     # ------------------------------------------------------------------
-    def catalog(self, static_models: list) -> dict:
+    def catalog(self, static_models: list, forward_static: list | None = None) -> dict:
         """把静态清单 + 服务实时状态合成一张状态矩阵。
 
         每个模型的状态取值：
@@ -307,6 +346,10 @@ class ModelServiceClient:
             failed       加载失败（error 给原因）
             idle         文件在，但没加载 —— 点一下就能后启动
             unavailable  模型文件缺失 —— 先放好文件
+
+        forward_static：正向模型（可行性过滤判据）的静态清单，形状同 static_models。
+        它**不是**搜索主模型，所以不混进 `models`（混进去前端就会把它渲染成一格
+        可选的"预测模型"，选中它跑逆合成必然失败）；单独放在 `forward` 字段。
         """
         st = self.status()
         svc_state = str(st.get("state") or "stopped")
@@ -338,6 +381,30 @@ class ModelServiceClient:
                 state = "idle"
             rows.append({**m, "state": state, "is_current": key == cur})
 
+        forward = None
+        if forward_static:
+            fm = dict(forward_static[0])
+            fsvc = st.get("forward") or {}
+            f_own = str(fsvc.get("state") or "idle")
+            f_key = str(fsvc.get("key") or "")
+            if not fm["exists"]:
+                f_state = "unavailable"
+            elif not st.get("running") or (f_key and f_key != fm["key"]):
+                # 🔴 服务没在跑（HTTP 不通）时内存里那份正向模型**用不上** ——
+                #    搜索要经 HTTP 转接，这里如实报 idle，别给一个"已就绪"的假象。
+                #    报的是另一个正向模型（换过）时同理。
+                f_state = "idle"
+            else:
+                f_state = f_own if f_own in ("loading", "ready", "failed") else "idle"
+            fm.update(
+                {
+                    "state": f_state,
+                    "error": str(fsvc.get("error") or ""),
+                    "load_seconds": fsvc.get("load_seconds"),
+                }
+            )
+            forward = fm
+
         # 🔴 HTTP 还没起的那段窗口里，状态是从 **state 文件**读的，而文件里
         #    没有 `elapsed`（那是 ModelHost 现算的）。前端要显示「加载中（已 12s）」，
         #    这个秒数在这里补出来 —— 否则加载早期那几十秒界面上只有一句"加载中"，
@@ -363,4 +430,5 @@ class ModelServiceClient:
             },
             "current": cur,
             "models": rows,
+            "forward": forward,
         }

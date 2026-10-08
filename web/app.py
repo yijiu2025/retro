@@ -76,6 +76,7 @@ from model_client import ModelServiceClient  # noqa: E402
 from model_runtime import (  # noqa: E402
     MODELS,
     canon_smiles,
+    forward_models_catalog,
     make_inventory,
     make_value_function,
     models_catalog,
@@ -180,6 +181,9 @@ def _setup_jobhub():
             validate_target_smiles=validate_target_smiles,
             search_fn=search_remote,
             model_keys=set(MODELS.keys()),
+            # 开启「可行性过滤」前的闸门：在开跑之前就判正向模型在不在，
+            # 免得搜索整趟跑完才失败（见 _require_forward_ready 的注释）。
+            forward_check=_require_forward_ready,
         )
     return _PREDICT_RUNNER
 
@@ -230,9 +234,36 @@ def predict_remote(smiles: str, model_key: str, num_results: int) -> list:
     return _model_service.predict(smiles, num_results)
 
 
+def _require_forward_ready() -> None:
+    """「可行性过滤」要用正向模型当判据 —— 把没加载 / 在加载 / 加载失败分开讲清。
+
+    🔴 为什么要在这里提前拦：不拦的话，这条错误会在**搜索已经开跑之后**才从模型
+       服务冒出来。用户先看到进度条动了、再看到失败，白等一整趟。这里把它提到
+       提交之前，错在哪儿当场说清。
+    """
+    fwd = service_status().get("forward") or {}
+    state = str(fwd.get("state") or "idle")
+    if state == "ready":
+        return
+    if state == "loading":
+        raise RuntimeError("正向模型正在加载中 —— 等它变成「已就绪」再开「可行性过滤」")
+    if state == "failed":
+        raise RuntimeError(f"正向模型加载失败：{fwd.get('error') or '原因见模型服务窗口'}")
+    if state == "unavailable":
+        raise RuntimeError(
+            "正向模型文件不在 models/ 目录里 —— 先跑 scripts/download_model.py 放好文件，"
+            "再在「运行参数 → 拆分约束 → 可行性过滤」里点「加载正向模型」"
+        )
+    raise RuntimeError(
+        "正向模型还没加载 —— 在「运行参数 → 拆分约束 → 可行性过滤」里点「加载正向模型」"
+    )
+
+
 def search_remote(params: dict) -> dict:
     """搜索桥：HTTP 转接到常驻模型服务（返回 run_retro_search 的那个 dict）。"""
     _require_model_ready(str(params.get("model") or ""))
+    if params.get("use_forward_filter"):
+        _require_forward_ready()
     return _model_service.search(params)
 
 
@@ -277,6 +308,7 @@ _API_INDEX = {
     "endpoints": [
         {"method": "GET", "path": "/api/models", "desc": "模型状态矩阵（每个模型 idle/loading/ready/failed + 服务概览）"},
         {"method": "POST", "path": "/api/load", "desc": "加载/切换模型（后启动；立刻返回，进度看 /api/models）"},
+        {"method": "POST", "path": "/api/forward/load", "desc": "加载正向模型（可行性过滤判据；立刻返回，进度看 /api/models 的 forward）"},
         {"method": "POST", "path": "/api/model-service/<action>", "desc": "模型服务 start / stop / restart"},
         {"method": "POST", "path": "/api/predict", "desc": "单步逆合成预测"},
         {"method": "POST", "path": "/api/search", "desc": "多步路线搜索（脚本/调试用）"},
@@ -323,8 +355,12 @@ def api_models():
     🔴 从前这里把所有模型都报 `loaded: 全局布尔` —— 实际只有预加载那一个真的
        加载了，另一个是假的，前端于是显示「已加载」却一预测就失败。现在按
        **每个模型**的真实状态报，没加载的就是 idle，点一下才后启动。
+
+    另外附带一个 `forward` 字段：正向模型（「可行性过滤」的判据）。它**不是**
+    搜索主模型，所以不混进 `models` —— 否则前端会把它渲染成一格可选的"预测模型"，
+    而选中它去跑逆合成必然失败。
     """
-    return jsonify(_model_service.catalog(models_catalog()))
+    return jsonify(_model_service.catalog(models_catalog(), forward_models_catalog()))
 
 
 # --------------------------------------------------------------------------
@@ -646,6 +682,42 @@ def api_load():
             500,
         )
     return jsonify({"ok": True, "model": key, "started": True, "service": svc})
+
+
+@app.route("/api/forward/load", methods=["POST"])
+def api_forward_load():
+    """加载正向模型（「可行性过滤」的判据）。
+
+    body: {forward?: "forward_pistachio"}（不传则由模型服务按 RETRO_PRELOAD_FORWARD /
+    注册表第一项兜底）
+
+    语义与 /api/load 一样是「**已受理**」，不是「已就绪」：
+      - 模型服务没在跑 ⇒ 直接报错（正向模型挂在它下面，乱拉一份会多一个进程）
+      - 已在加载同一个 ⇒ already:true，不会载两份
+
+    🔴 与 /api/load 的关键区别：**不需要重启模型服务**。正向模型是纯 transformer，
+       构造时不 spawn 规则子进程 ⇒ 可以在 HTTP 起来之后热挂（见 model_server.py）。
+       所以这里没有「换模型 = 重启进程」那一步，也不会连带把已加载的逆向模型踢掉。
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    key = str(data.get("forward") or "").strip()
+    st = _model_service.status()
+    if not st.get("running"):
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": "模型服务未运行 —— 请先在「运行参数 → 预测模型」里点「加载模型」",
+                }
+            ),
+            400,
+        )
+    try:
+        out = _model_service.load_forward(key)
+    except Exception as e:  # noqa: BLE001
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": f"{type(e).__name__}: {e}"}), 500
+    return jsonify({**out, "ok": True, "started": bool(out.get("started", True))})
 
 
 @app.route("/api/model-service/<action>", methods=["POST"])
@@ -1177,7 +1249,8 @@ def api_jobs_create():
       请求体：{"smiles": "...", "model": "pistachio", "max_routes": 5,
                "max_calls": 60, "time_limit": 120, "max_depth": 3,
                "max_heavy_atoms": 10, "value_fn": "complexity",
-               "purchasable": [], "required_materials": []}
+               "purchasable": [], "required_materials": [],
+               "use_forward_filter": false, "forward_top_k": 5}
 
     响应：  {"ok": true, "job_id": "..."}
     """
@@ -1189,6 +1262,10 @@ def api_jobs_create():
 
     kind = str(data.get("kind") or "predict").strip().lower()
     if kind == "search":
+        try:
+            forward_top_k = max(1, min(int(data.get("forward_top_k", 5)), 50))
+        except (TypeError, ValueError):
+            forward_top_k = 5
         params = {
             "smiles": str(data.get("smiles")).strip(),
             "model": data.get("model", "pistachio"),
@@ -1200,6 +1277,9 @@ def api_jobs_create():
             "value_fn": str(data.get("value_fn") or "complexity"),
             "purchasable": data.get("purchasable") or [],
             "required_materials": data.get("required_materials") or [],
+            # 可行性过滤（正向模型当判据）。默认关 —— 它要额外常驻一份正向模型。
+            "use_forward_filter": bool(data.get("use_forward_filter")),
+            "forward_top_k": forward_top_k,
         }
         job = jobhub.submit("search", params, _SEARCH_RUNNER)
     else:
@@ -1413,6 +1493,12 @@ def api_search():
     if not ok_smi:
         return jsonify(err), 400
 
+    use_forward_filter = bool(data.get("use_forward_filter"))
+    try:
+        forward_top_k = max(1, min(int(data.get("forward_top_k", 5)), 50))
+    except (TypeError, ValueError):
+        forward_top_k = 5
+
     try:
         t0 = time.time()
         # 🔴 搜索一律转接到模型服务（复用那份已加载的模型，本进程不载第二份）。
@@ -1429,6 +1515,10 @@ def api_search():
                 "value_fn": value_fn,
                 "purchasable": purchasable,
                 "required_materials": required,
+                # 可行性过滤：正向模型当判据（见 model_runtime.wrap_with_forward_filter）。
+                # 正向模型对象常驻在模型服务里，由那边按真实状态注入 —— 客户端只说要不要。
+                "use_forward_filter": use_forward_filter,
+                "forward_top_k": forward_top_k,
             }
         )
         # 同步接口补上 model（异步 job 的 result 由 runner 统一补元信息）
