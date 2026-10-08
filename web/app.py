@@ -7,6 +7,9 @@
 
 浏览器打开 http://127.0.0.1:8000   ← 只返回端点清单 JSON，不托管前端页面
 """
+# 与 llm.py / jobhub.py 一致：推迟注解求值，允许 Python 3.9 下使用 `X | None` 语法
+from __future__ import annotations
+
 import os
 import re
 import sys
