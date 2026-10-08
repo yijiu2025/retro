@@ -186,6 +186,39 @@ def _int_in(raw, default: int, lo: int, hi: int) -> int:
         return default
 
 
+def _max_tokens_in(raw) -> int:
+    """max_tokens 专用：0（或空）表示「无限制」——不设上限，交给模型/网关默认值。
+
+    非 0 时才 clamp 到 [16, 1_000_000]（下限 16 是为了防「额度小到思考 token 吃光、
+    正文 0 字符」；上限 1_000_000 防离谱值）。0 本身是合法语义，不能像 `_int_in`
+    那样被 clamp 到 lo。
+    """
+    if raw is None or raw == "":
+        return 0
+    try:
+        v = int(raw)
+    except (TypeError, ValueError):
+        return 0
+    if v <= 0:
+        return 0
+    return min(1_000_000, max(16, v))
+
+
+def _tokens_hint(cfg: dict) -> str:
+    """截断报错的「怎么调」完整从句。max_tokens=0（无限制）时不能说「当前 0，请调大」。
+
+    无限制下仍被截断 ⇒ 撞的是**模型/网关自身的上下文上限**，本侧改 max_tokens 无效，
+    得换更长上下文的模型或网关侧放宽，所以提示文案要换一套。
+    """
+    mt = cfg.get("max_tokens")
+    if not mt:
+        return (
+            "当前输出上限为「无限制」（不传 max_tokens），仍被截断说明撞到了模型/网关"
+            "自身的上下文上限 —— 请换一个上下文更长的模型，或联系网关方放宽上限"
+        )
+    return f"请调大 .env 里的 RETRO_LLM_MAX_TOKENS（当前 {mt}）"
+
+
 def _float_in(raw, default: float, lo: float, hi: float) -> float:
     try:
         return min(hi, max(lo, float(raw)))
@@ -234,7 +267,7 @@ def _norm_profile(raw: object, used: set) -> Optional[dict]:
         "base_url": base_url,
         "model": model,
         "api_keys": keys,
-        "max_tokens": _int_in(raw.get("max_tokens"), 32768, 16, 1_000_000),
+        "max_tokens": _max_tokens_in(raw.get("max_tokens")),
         "temperature": _float_in(raw.get("temperature"), 0.3, 0.0, 2.0),
         "timeout": _int_in(raw.get("timeout"), 300, 5, 3600),
         "json_mode": _bool_of(raw.get("json_mode"), True),
@@ -588,7 +621,8 @@ def config() -> dict:
         "api_key": keys[idx] if keys else "",  # 当前活跃 key（向后兼容旧调用方）
         "model": str(_raw("model") or "").strip(),
         "timeout": _num("timeout", "180", float, 5.0, 3600.0),
-        "max_tokens": int(_num("max_tokens", "8192", int, 16, 1_000_000)),
+        # 0 = 无限制（不设上限，交给模型默认）；非 0 走 [16, 1_000_000] clamp
+        "max_tokens": _max_tokens_in(_raw("max_tokens")),
         "json_mode": _flag("json_mode", "1"),
         "temperature": _num("temperature", "0.3", float, 0.0, 2.0),
     }
@@ -1516,6 +1550,7 @@ def _body(cfg: dict, messages: list, stream: bool, json_mode: Optional[bool] = N
     # 🔴 必须显式给 max_tokens：不给就用网关默认值，而**推理模型的思考 token 也算在
     #    输出额度里**（实测 max_tokens=8 时思考就吃光、正文一个字都没有、finish_reason=length）。
     #    额度太小 ⇒ 返回被静默截断 ⇒ JSON 抽不出来，报错还看不出是截断导致的。
+    #    max_tokens=0 表示「无限制」：用户显式选了不设上限，这里就不发字段、交给模型默认。
     if cfg.get("max_tokens"):
         body["max_tokens"] = int(cfg["max_tokens"])
     # 🔴 json_mode 显式传 False 时必须**覆盖**配置里的 json_mode：追问要的是自由文本回答，
@@ -1621,7 +1656,7 @@ def analyze(req: dict) -> dict:
     if finish_reason == "length" and not data:
         raise RuntimeError(
             f"模型输出被截断（finish_reason=length，正文 {len(raw)} 字符）："
-            f"调大 .env 里的 RETRO_LLM_MAX_TOKENS（当前 {cfg.get('max_tokens')}）"
+            f"{_tokens_hint(cfg)}"
         )
     return {"raw": raw, "data": data, "computed": masses, "model": cfg["model"], "finish_reason": finish_reason}
 
@@ -1742,8 +1777,8 @@ def stream_analyze(req: dict) -> Iterator[str]:
                     "type": "error",
                     "error": (
                         f"模型输出被截断（finish_reason=length，已收到 {len(raw)} 字符正文）。"
-                        f"推理模型的思考 token 也计入输出额度 ⇒ 调大 .env 里的 RETRO_LLM_MAX_TOKENS"
-                        f"（当前 {cfg.get('max_tokens')}）。也可以点「接着分析」从断点续写。"
+                        f"推理模型的思考 token 也计入输出额度 ⇒ {_tokens_hint(cfg)}。"
+                        f"也可以点「接着分析」从断点续写。"
                     ),
                 }
             )
@@ -2021,7 +2056,7 @@ def stream_conditions(req: dict) -> Iterator[str]:
                     "type": "error",
                     "error": (
                         f"枚举被截断（finish_reason=length，已收到 {len(raw)} 字符正文）："
-                        f"多方案输出较长，请调大输出上限（当前 {cfg.get('max_tokens')}）"
+                        f"多方案输出较长，{_tokens_hint(cfg)}"
                         f"或减少方案数。"
                     ),
                 }
@@ -2206,8 +2241,7 @@ def stream_followup(req: dict) -> Iterator[str]:
                     "type": "error",
                     "error": (
                         f"回答被截断（finish_reason=length，正文 0 字符）："
-                        f"推理模型的思考 token 也计入输出额度，请调大输出上限"
-                        f"（当前 {cfg.get('max_tokens')}）。"
+                        f"推理模型的思考 token 也计入输出额度，{_tokens_hint(cfg)}。"
                     ),
                 }
             )
