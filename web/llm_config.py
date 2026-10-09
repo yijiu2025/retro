@@ -552,12 +552,41 @@ def key_states(profile_id: str = "", keys: Optional[list] = None) -> list[dict]:
         )
     return out
 
-def config() -> dict:
+def config(override: Optional[dict] = None) -> dict:
     """读**当前激活的端点配置**（改完下一次请求即生效）。
 
     优先级：profiles[active] → 老的顶层扁平字段 → .env / 环境变量。
     中间那一级只为兼容「升级前写下的 llm_settings.json」而留。
+
+    🔴 `override` 是「请求级凭据覆盖」：Node 中转按用户身份解析出该用户该用哪套 LLM
+       （用户自建 → 官方 → 都不命中则不传），把 `{base_url, api_keys, model}` 塞进
+       请求体的 `profile` 字段。这里命中 override 时**不再读盘**，凭据完全由请求方注入
+       —— 官方 key 只在内网 Node→Python 出现，永不出前端、永不落盘。
+       字段白名单：base_url / api_keys / model；其余（timeout/max_tokens/temperature 等）
+       仍走默认，避免请求方把超时/温度也当成注入口。
     """
+    if override:
+        base_url = str(override.get("base_url") or "").strip()
+        api_keys = [str(k).strip() for k in (override.get("api_keys") or []) if str(k).strip()]
+        model = str(override.get("model") or "").strip()
+        if base_url and api_keys and model:
+            keys = api_keys
+            idx = 0
+            return {
+                "profile_id": "",
+                "profile_name": "(请求注入)",
+                "base_url": _chat_url(base_url),
+                "api_keys": keys,
+                "api_key": keys[idx],
+                "model": model,
+                "timeout": 180.0,
+                "max_tokens": 0,
+                "max_tokens_source": "override",
+                "json_mode": True,
+                "temperature": 0.3,
+            }
+        # override 字段不全（base_url/api_keys/model 缺一）⇒ 忽略，回落读盘，别半套凭据去调模型
+
     _load_env_file()
     ov = _read_settings_file()
     prof = _active_profile(_norm_profiles(ov)) or {}

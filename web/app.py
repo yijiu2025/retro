@@ -779,6 +779,25 @@ def _llm_common_payload(data: dict) -> dict:
     if isinstance(modules, str):
         modules = [m for m in modules.split(",") if m]
     modules = [str(m).strip() for m in modules if str(m).strip()]
+    # 🔴 请求级 LLM 凭据覆盖（Node 中转按用户身份注入）：白名单 base_url / api_keys / model。
+    #    前端不传这个字段（它不该知道官方 key）；只有 Node 中转在服务端注入。
+    profile = None
+    raw_profile = data.get("profile")
+    if isinstance(raw_profile, dict):
+        p = {}
+        base_url = str(raw_profile.get("base_url") or "").strip()
+        if base_url:
+            p["base_url"] = base_url
+        raw_keys = raw_profile.get("api_keys")
+        if isinstance(raw_keys, list):
+            keys = [str(k).strip() for k in raw_keys if str(k).strip()]
+            if keys:
+                p["api_keys"] = keys
+        model = str(raw_profile.get("model") or "").strip()
+        if model:
+            p["model"] = model
+        if p:
+            profile = p
     return {
         "product": str(data.get("product") or "").strip(),
         "precursors": [str(p).strip() for p in precursors if str(p).strip()],
@@ -787,6 +806,7 @@ def _llm_common_payload(data: dict) -> dict:
         "context": data.get("context") or {},
         "continue_from": str(data.get("continue_from") or "").strip(),
         "modules": modules,
+        "profile": profile,
     }
 
 

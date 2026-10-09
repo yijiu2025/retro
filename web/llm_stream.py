@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 from typing import Iterator
-from llm_config import LlmConfigError, MultiKeyError, _tokens_hint, config, is_configured, public_status
+from llm_config import LlmConfigError, MultiKeyError, _tokens_hint, config, public_status
 from llm_prompts import _norm_conditions, build_conditions_messages, build_followup_messages, build_messages, mass_info
 from llm_transport import _body, _delta_of, _error_text, _is_transient, _think_of, extract_json, network_error_text, request_chat
 
@@ -17,8 +17,8 @@ from llm_transport import _body, _delta_of, _error_text, _is_transient, _think_o
 
 def analyze(req: dict) -> dict:
     """非流式：一次性拿到结构化结果。"""
-    cfg = config()
-    if not is_configured():
+    cfg = config(req.get("profile"))
+    if not (cfg["base_url"] and cfg["model"] and cfg["api_keys"]):
         raise RuntimeError(public_status()["hint"] or "大模型未配置")
 
     masses = mass_info([req.get("product") or ""] + list(req.get("precursors") or []))
@@ -77,10 +77,10 @@ def stream_analyze(req: dict) -> Iterator[str]:
     def sse(obj: dict) -> str:
         return "data: " + json.dumps(obj, ensure_ascii=False) + "\n\n"
 
-    cfg = config()
+    cfg = config(req.get("profile"))
     tried: list[str] = []
     try:
-        if not is_configured():
+        if not (cfg["base_url"] and cfg["model"] and cfg["api_keys"]):
             yield sse({"type": "error", "error": public_status()["hint"] or "大模型未配置"})
             return
 
@@ -221,10 +221,10 @@ def stream_conditions(req: dict) -> Iterator[str]:
     def sse(obj: dict) -> str:
         return "data: " + json.dumps(obj, ensure_ascii=False) + "\n\n"
 
-    cfg = config()
+    cfg = config(req.get("profile"))
     tried: list[str] = []
     try:
-        if not is_configured():
+        if not (cfg["base_url"] and cfg["model"] and cfg["api_keys"]):
             yield sse({"type": "error", "error": public_status()["hint"] or "大模型未配置"})
             return
         count = req.get("count")
@@ -346,10 +346,10 @@ def stream_followup(req: dict) -> Iterator[str]:
     def sse(obj: dict) -> str:
         return "data: " + json.dumps(obj, ensure_ascii=False) + "\n\n"
 
-    cfg = config()
+    cfg = config(req.get("profile"))
     tried: list[str] = []
     try:
-        if not is_configured():
+        if not (cfg["base_url"] and cfg["model"] and cfg["api_keys"]):
             yield sse({"type": "error", "error": public_status()["hint"] or "大模型未配置"})
             return
         question = str(req.get("question") or "").strip()
