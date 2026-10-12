@@ -1,0 +1,85 @@
+# Third-Party Notices
+
+本项目（RetroChimera API 后端）以 MIT 许可发布，但仓库中包含**第三方代码**。
+分发本项目或其衍生作品时，请同时遵守以下声明。
+
+---
+
+## 1. RetroChimera（上游模型源码）
+
+- **位置**：`core/`
+- **来源**：<https://github.com/microsoft/retrochimera>
+- **版本**：v1.3.0（源码副本，见 `core/VENDORED.md`）
+- **许可**：MIT License — Copyright (c) Microsoft Corporation
+- **完整声明**：见 [`core/LICENSE`](core/LICENSE)
+
+`core/` 是**上游原样搬运**，本项目未修改其许可条款。该目录中的代码、注释与文档
+版权归 Microsoft Corporation 所有。
+
+> ⚠️ **为什么必须单独声明**：MIT 条款要求"在所有副本或实质性部分中包含版权声明与
+> 许可声明"。`core/` 是实质性部分（含完整模型实现），因此不能只靠根目录的
+> `LICENSE` 覆盖，必须保留上游的原始声明。
+
+---
+
+## 2. 上游衍生代码
+
+以下目录同样来自 RetroChimera 上游仓库（其内部又各含第三方拷贝），
+各自的原始声明一并保留在 `core/` 内：
+
+| 目录 | 来源 | 说明 |
+|---|---|---|
+| `core/retrochimera/dgllife/` | [dgl-lifesci](https://github.com/awslabs/dgl-lifesci) v0.3.0 | 只取用一个 featurizer，避免拉入 `dgl` 重依赖 |
+| `core/retrochimera/opennmt/` | [OpenNMT-py](https://github.com/OpenNMT/OpenNMT-py) v3.5.1 | 因需改内部实现而整目录拷贝 |
+
+各目录下的 README 与源文件内保留有其原始许可信息。
+
+---
+
+## 3. 运行时依赖
+
+以下依赖经由 pip / conda 安装，**不包含在本仓库中**，但运行时会被加载。
+它们各自采用独立的开源许可，版权归各自作者所有。分发衍生作品时，
+是否需要一并提供这些许可声明，取决于你的分发方式（容器镜像、商业分发等）。
+
+**主要依赖**（完整清单见 `web/requirements.txt` 与 `core/pyproject.toml`）：
+
+| 组件 | 许可 |
+|---|---|
+| [PyTorch](https://github.com/pytorch/pytorch) | BSD-3-Clause |
+| [PyTorch Geometric](https://github.com/pyg-team/pytorch_geometric) | MIT |
+| [RetroChimera](https://github.com/microsoft/retrochimera) | MIT（见第 1 节） |
+| [Syntheseus](https://github.com/microsoft/syntheseus) | MIT |
+| [RDKit](https://github.com/rdkit/rdkit) | BSD |
+| [Flask](https://github.com/pallets/flask) | BSD-3-Clause |
+| [more-itertools](https://github.com/more-itertools/more-itertools) | MIT |
+| [wandb](https://github.com/wandb/wandb) | Apache-2.0 |
+| [h5py](https://github.com/h5py/h5py) | BSD-3-Clause |
+| [Pebble](https://github.com/certtools/pebble) | MIT |
+
+> 📌 上表仅列出**主要**依赖，用于提示而非穷举。完整的依赖与版本见
+> `web/requirements.txt`（含实测组合说明）与 `core/pyproject.toml`。
+>
+> 本项目使用 PyTorch Geometric 的 wheel 由 `data.pyg.org` 提供，
+> RetoChimera 的 checkpoint 由 [figshare](https://figshare.com/) 分发，
+> 二者的分发渠道（`data.pyg.org` / `figshare.com`）不随本仓库分发。
+
+---
+
+## 4. 模型权重
+
+`models/` 下的 checkpoint（`.ckpt`/`.zip`）**不包含在本仓库中**（体积 9GB，见
+`.gitignore`），需通过 `python scripts/download_model.py` 单独获取。
+
+权重由 RetroChimera 上游项目发布，其使用条款**请以上游仓库
+（<https://github.com/microsoft/retrochimera>）为准** —— MIT 许可覆盖的是
+**代码**，不自动涵盖模型权重。请在分发权重前确认上游的相关说明。
+
+---
+
+## 5. 本项目自身的许可
+
+除上述第三方部分外，本仓库新增的代码（`web/`、`bootstrap/`、`scripts/`、
+`deploy/` 等）以 MIT 许可发布，完整条款见根目录 [`LICENSE`](LICENSE)。
+
+Copyright (c) 2026 yijiu2025
