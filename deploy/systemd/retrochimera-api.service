@@ -1,0 +1,50 @@
+# RetroChimera API —— systemd 单元（Flask 转接层）
+#
+# 🔴 与模型服务的区别：这个进程**不加载模型**，秒起、无大内存占用，
+#    所以可以给很激进的重启策略（崩了立刻拉起），也适合多实例负载均衡。
+
+[Unit]
+Description=RetroChimera API（转接层，不加载模型）
+After=network-online.target retrochimera-model.service
+Wants=network-online.target
+# 🔴 要 model 先起，但不设硬依赖（Requires）：模型加载慢 1~2 分钟，
+#    硬依赖会让 API 在模型就绪前一直起不来。而 API 在模型没就绪时
+#    也能正常响应 —— /api/models 会如实报「加载中」+ 进度百分比。
+Requires=retrochimera-model.service
+After=retrochimera-model.service
+
+[Service]
+Type=simple
+ExecStart=/srv/retrochimera/.venv/bin/python -u /srv/retrochimera/run_api.py
+WorkingDirectory=/srv/retrochimera
+
+Environment=RETRO_PORT=8000
+Environment=RETRO_MODEL_PORT=8001
+# 同机部署：模型服务在本机 127.0.0.1
+# 🔴 反馈数据固定写在 web/data/feedback.jsonl（硬编码在 app.py 的
+#    _FEEDBACK_PATH，没有环境变量可改）。所以只读权限里必须包含它，
+#    否则 /api/feedback 会因为不能写而报错。
+Environment=RETRO_MODEL_HOST=127.0.0.1
+# EnvironmentFile=/etc/retrochimera.env   ← 大模型 key 放这里，别写进本文件
+
+# Flask 自带的开发服务器只适合内网/低并发。
+# 对外提供服务请在前面放 nginx / caddy 做 TLS 与静态资源，或改用 gunicorn。
+Restart=always
+RestartSec=5
+TimeoutStartSec=60
+TimeoutStopSec=20
+
+MemoryMax=4G
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/var/lib/retrochimera /srv/retrochimera/web/data
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=retrochimera-api
+
+[Install]
+WantedBy=multi-user.target

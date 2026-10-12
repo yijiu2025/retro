@@ -1,0 +1,50 @@
+# Docker 构建上下文里**不要**的东西。
+#
+# 🔴 models/ 是重点：9GB 权重。漏掉这一行，`docker build` 会尝试把 9GB
+#    传给 daemon，轻则构建巨慢，重则磁盘写满。权重一律用 volume 挂载。
+
+# 模型权重与数据
+models/
+web/data/
+*.ckpt
+*.pt
+*.zip
+
+# 🔴 真实密钥：绝不能进镜像层（层是可被检出的，即使后续层删掉）
+web/.env
+.env
+web/llm_settings.json
+
+# 版本控制与编辑器
+.git/
+.gitignore
+.vscode/
+.idea/
+.DS_Store
+
+# Python 产物
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 运行时产物
+.tmp-*/
+_startup_log.txt
+*.log
+*.pid
+*.bak
+outputs/
+tmp/
+
+# 工作记忆（本地开发产物）
+.workbuddy/
+
+# Windows 专用（本镜像基于 Linux）
+*.bat

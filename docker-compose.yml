@@ -1,0 +1,103 @@
+# RetroChimera —— 两服务编排（api + model）
+#
+# 🔴 为什么必须拆成两个容器，而不是一个容器里跑俩进程：
+#    模型服务加载权重要吃几 GB 内存、约 1~2 分钟，API 则是秒起。
+#    合成一个容器意味着「改前端配置也得等模型重新加载」；
+#    分开则 API 可以随时重启/水平扩展，而模型一直常驻。
+#
+# 启动：
+#     cp web/.env.example web/.env && vi web/.env     # 填大模型 key（可选）
+#     docker compose up -d --build
+#     docker compose logs -f model                      # 看模型加载进度
+#     curl http://127.0.0.1:8000/api/models             # 状态矩阵
+#
+# GPU 版：
+#     把 MODEL 段的 image 换成 GPU tag（构建时带 --build-arg 选 cu121），
+#     并放开下面的 deploy.resources.reservations.devices。
+
+name: retrochimera
+
+services:
+  # ---------------------------------------------------------------- 模型服务
+  # 真正加载 checkpoint、跑推理/搜索的地方。**不对外暴露端口** ——
+  # 它没有鉴权，能连上就能消耗整台机器的算力。只在内部网络可达。
+  model:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # GPU：改成 https://download.pytorch.org/whl/cu121，且 PYG_WHEEL_TAG 用 +cu121
+        TORCH_INDEX_URL: https://download.pytorch.org/whl/cpu
+        PYG_WHEEL_TAG: torch-2.2.0+cpu
+    image: retrochimera:1.3.0
+    container_name: retrochimera-model
+    restart: unless-stopped
+    command: ["python", "-u", "web/model_server.py"]
+    environment:
+      RETRO_MODEL_PORT: "8001"
+      # 🔴 容器内绑 127.0.0.1 就够 —— api 容器通过 compose 网络访问，
+      #    走的是网络命名空间里的本机地址，不需要 0.0.0.0。
+      RETRO_MODEL_HOST: "127.0.0.1"
+      # 开机就预加载 Pistachio：省掉首次使用时的等待。
+      # 想开机不加载（省内存）就设为 none。
+      RETRO_PRELOAD: "pistachio"
+      # 🔴 内存的真正大头：每个规则子进程约 4.4GB。默认 4 ≈ 18GB。
+      #    机器内存 < 16GB 时务必调到 2，否则会被 OOM Killer 杀掉
+      #    （症状是容器无故重启，日志里没有 Python 异常）。
+      RETRO_RULE_WORKERS: "${RETRO_RULE_WORKERS:-4}"
+      RETRO_MODELS_DIR: /app/models
+    volumes:
+      # 权重 9GB，**必须挂载**。ro = 只读，防止容器误改损坏权重。
+      - "${RETRO_MODELS_HOST:-./models}:/app/models:ro"
+    # 不写 ports ⇒ 不映射到宿主机，只能被同网络的其他容器访问
+    networks: [retro]
+    # GPU 版放开这段（并把上面 image 换成 GPU tag）：
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+    # 加载慢，start_period 给足（否则健康检查会一直判失败）
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=5).status==200 else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      # 🔴 首次加载约 2 分钟，这段时间 /health 还没起来 —— 必须给足宽限期，
+      #    否则 compose 会一直报 "model is unhealthy" 并可能反复重启它。
+      start_period: 240s
+
+  # ---------------------------------------------------------------- API 服务
+  # 只做转接：秒起、无状态，可随时重启/多副本。
+  api:
+    image: retrochimera:1.3.0
+    container_name: retrochimera-api
+    restart: unless-stopped
+    depends_on:
+      model:
+        condition: service_healthy
+    environment:
+      RETRO_PORT: "8000"
+      RETRO_MODEL_PORT: "8001"
+      # 🔴 指到服务名而不是 127.0.0.1：api 容器和 model 容器是两个网络命名空间，
+      #    在 api 里 127.0.0.1 指向它自己，连不上模型服务。
+      RETRO_MODEL_HOST: "model"
+      # 大模型 key 等配置（web/.env 里的内容，compose 不会自动读 web/.env）
+      RETRO_LLM_BASE_URL: "${RETRO_LLM_BASE_URL:-}"
+      RETRO_LLM_API_KEY: "${RETRO_LLM_API_KEY:-}"
+      RETRO_LLM_MODEL: "${RETRO_LLM_MODEL:-}"
+      # 浏览器直连 API 时需要（CORS）；不设则默认关闭
+      RETRO_CORS_ORIGINS: "${RETRO_CORS_ORIGINS:-}"
+    ports:
+      - "${RETRO_API_PORT:-8000}:8000"
+    volumes:
+      # 反馈数据要落盘，容器重启不能丢
+      - "./web/data:/app/web/data"
+    networks: [retro]
+
+networks:
+  retro:
+    driver: bridge

@@ -1,0 +1,74 @@
+# RetroChimera API —— systemd 单元（Linux 生产部署）
+#
+# 安装：
+#   sudo cp deploy/systemd/retrochimera-api.service /etc/systemd/system/
+#   sudo cp deploy/systemd/retrochimera-model.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now retrochimera-model retrochimera-api
+#
+# 常用：
+#   systemctl status  retrochimera-api
+#   journalctl -u retrochimera-model -f      # 看模型加载进度
+#   systemctl restart retrochimera-model      # 改了模型服务代码后必须重启
+#   systemctl restart retrochimera-api         # 改了 API 代码后
+#
+# 🔴 两个服务必须分开装、且 **model 先起**：
+#    模型服务加载权重要 1~2 分钟，API 只是转接、秒起。
+#    这正是当初把模型拆成独立进程的好处 —— 改前端/调 API 配置不必等模型重载。
+
+[Unit]
+Description=RetroChimera 模型服务（加载权重、跑推理与搜索）
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 🔴 改成你的解释器。用 setup_env_linux.sh --venv 装的话就是
+#    /srv/retrochimera/.venv/bin/python
+ExecStart=/srv/retrochimera/.venv/bin/python -u /srv/retrochimera/web/model_server.py
+WorkingDirectory=/srv/retrochimera
+
+# ---- 环境 ----
+# ⚠️ 这里**故意不写死密钥**。需要大模型 key 的话，把 web/.env 里的
+#    RETRO_LLM_* 放进 /etc/retrochimera.env（见文件末尾的说明），
+#    然后在本节加一行：EnvironmentFile=/etc/retrochimera.env
+Environment=RETRO_MODEL_PORT=8001
+# 默认只绑本机。前端不直连模型服务，安全起见别改成 0.0.0.0。
+Environment=RETRO_MODEL_HOST=127.0.0.1
+Environment=RETRO_RULE_WORKERS=4
+Environment=RETRO_MODELS_DIR=/srv/retrochimera/models
+# 开机预加载 Pistachio（省掉首次等待）；想开机不加载就设 none
+Environment=RETRO_PRELOAD=pistachio
+# 产日志文件（默认在仓库根的 .tmp-model-service/state-8001.json）
+Environment=RETRO_MODEL_STATE_FILE=/var/lib/retrochimera/state-8001.json
+
+Restart=always
+RestartSec=10
+# 加载期间被杀也要能起来
+TimeoutStartSec=600
+# 给 SIGTERM 一点时间回收规则子进程（收不掉会被 kill -9，僵尸进程堆积）
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# ---- 资源限制 ----
+# 🔴 内存上限必须设：规则子进程每个约 4.4GB，默认 4 个 ≈ 18GB，
+#    加上主进程峰值能到 25GB+。不设上限的话，一个泄漏就能把整机拖垮
+#    （Windows 上表现为 WinError 1455，Linux 上是 OOM Killer 静默杀进程）。
+MemoryMax=32G
+# 给一点 swap 空间兜底（加载权重时的瞬时峰值）
+MemorySwapMax=40G
+
+# ---- 安全加固 ----
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+# 只有模型目录和状态目录可写
+ReadWritePaths=/var/lib/retrochimera /srv/retrochimera/models
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=retrochimera-model
+
+[Install]
+WantedBy=multi-user.target
