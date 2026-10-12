@@ -1,0 +1,40 @@
+# 换行符与文件模式的强制约定。
+#
+# 🔴 最关键的一条：shell 脚本必须**永远**是 LF。
+#    Windows 上 Git 默认按 core.autocrlf=true 把 LF 检出成 CRLF，于是
+#    `#!/usr/bin/env bash` 那行变成 `#!/usr/bin/env bash\r`，
+#    Linux/macOS 上执行直接报 "bad interpreter: /usr/bin/env: bash\r"。
+#    —— 而且这个错误只在真正部署到 Linux 时才暴露，本地 Windows 永远看不出来。
+
+# ---- shell / 配置：强制 LF（这些文件一旦被 CRLF 破坏就完全不能用）----
+*.sh        text eol=lf
+Dockerfile  text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.service   text eol=lf
+.gitignore  text eol=lf
+.dockerignore text eol=lf
+.gitattributes text eol=lf
+
+# ---- 文本：仓库内统一 LF，避免无意义的整行差异 ----
+*.py       text eol=lf
+*.md       text eol=lf
+*.txt      text eol=lf
+*.json     text eol=lf
+*.jsonl    text eol=lf
+*.example  text eol=lf
+.env.example text eol=lf
+
+# ---- 二进制：禁止任何换行转换（否则权重/wheel 会被损坏）----
+*.ckpt     binary
+*.pt       binary
+*.pth      binary
+*.zip      binary
+*.whl      binary
+*.pdf      binary
+*.png      binary
+*.jpg      binary
+
+# ---- Windows 启动脚本：必须是 CRLF，否则 cmd.exe 可能解析异常 ----
+*.bat      text eol=crlf
+*.cmd      text eol=crlf

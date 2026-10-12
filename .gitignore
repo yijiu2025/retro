@@ -42,3 +42,11 @@ Thumbs.db
 
 # === 临时工作目录（vendored 上游准备、探针等，绝不入库）===
 .tmp-*/
+
+# === AI 助手工作记忆（本地开发产物，含个人偏好，绝不入库）===
+.workbuddy/
+
+# === Linux 部署产物 ===
+# 注：.venv/ 与 _startup_log.txt 在上面「Python 产物」/「运行时日志」两段已列过。
+.venv/
+*.pid
