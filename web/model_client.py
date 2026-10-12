@@ -108,7 +108,13 @@ class ModelServiceClient:
 
     def __init__(self, port: int | None = None, state_file: str | None = None) -> None:
         self.port = int(port or os.environ.get("RETRO_MODEL_PORT", "8001"))
-        self.base = f"http://127.0.0.1:{self.port}"
+        # 🔴 host 必须可配：容器化 / 跨主机部署时，模型服务可能在**另一个容器/机器**
+        #    上（如 compose 里 api + model 两个 service，或 K8s 里两个 Pod）。
+        #    写死 127.0.0.1 在那种拓扑下会连不上自己的模型服务，而且症状很隐蔽
+        #    —— 只表现为「模型一直 loading / 不可达」，看不出是地址问题。
+        #    默认仍是 127.0.0.1（同机双进程），保持既有行为不变。
+        self.host = os.environ.get("RETRO_MODEL_HOST") or "127.0.0.1"
+        self.base = f"http://{self.host}:{self.port}"
         self.state_file = state_file or os.environ.get("RETRO_MODEL_STATE_FILE") or os.path.join(
             PARENT, ".tmp-model-service", f"state-{self.port}.json"
         )
@@ -160,8 +166,25 @@ class ModelServiceClient:
     # ------------------------------------------------------------------
     # 生命周期
     # ------------------------------------------------------------------
+    @property
+    def is_local(self) -> bool:
+        """模型服务是否在本机。决定 API 能不能「顺手把它拉起来」。"""
+        return self.host in ("127.0.0.1", "localhost", "::1")
+
     def _spawn(self, model_key: str) -> subprocess.Popen:
-        """起一份模型服务进程（独立控制台窗口）。"""
+        """起一份模型服务进程（独立控制台窗口）。
+
+        🔴 只在**同机**部署下可用：跨主机/容器时本进程拉起的子进程监听在它自己的
+           127.0.0.1 上，而我们在连 RETRO_MODEL_HOST —— 拉起来也连不上，纯属白费
+           （而且它会真的吃几个 GB 内存加载权重）。那种拓扑下应该由 compose /
+           systemd 单独拉起模型服务，API 只管 HTTP 连过去。
+        """
+        if not self.is_local:
+            raise RuntimeError(
+                f"RETRO_MODEL_HOST={self.host} 不是本机地址，API 不能自动拉起模型服务"
+                f"（拉起的进程只监听 127.0.0.1，连不上）。"
+                f"请用 docker compose / systemd 单独启动模型服务。"
+            )
         env = dict(os.environ)
         env["RETRO_MODEL_PORT"] = str(self.port)
         env["RETRO_MODEL_STATE_FILE"] = self.state_file
@@ -208,6 +231,16 @@ class ModelServiceClient:
         if st.get("state") == "loading" and st.get("source") == "file":
             return st
 
+        # 🔴 跨主机/容器部署：模型服务由 compose / systemd 独立管。
+        #    这里**不要**尝试拉起 —— _spawn 会抛异常，而报错信息得让人一眼看懂
+        #    「该去起模型服务」，而不是甩一句 multiprocessing/PermissionError。
+        if not self.is_local:
+            raise RuntimeError(
+                f"模型服务不可达（{self.base}），且它不在本机 —— "
+                f"API 无法自动拉起它。请先启动模型服务："
+                f"docker compose up -d model   （或 systemctl start retrochimera-model）"
+            )
+
         self._proc = self._spawn(model_key)
         end = time.time() + wait
         while time.time() < end:
@@ -234,6 +267,16 @@ class ModelServiceClient:
         cur = st.get("model") or ""
         if not force and st.get("running") and cur == model_key and st.get("state") in ("ready", "loading"):
             return {"ok": True, "already": True, **st}
+
+        # 🔴 跨主机/容器：不能重启别人的进程（stop() 打的是远端 /shutdown，
+        #    之后 _spawn 会在**本机**起一份连不上的）。改为直接把加载指令发给
+        #    远端服务 —— 它自己能重启自己加载新模型。
+        if not self.is_local:
+            try:
+                _http_json("POST", f"{self.base}/load", body={"model": model_key}, timeout=30.0)
+            except Exception as e:  # noqa: BLE001
+                raise RuntimeError(f"远程模型服务 {self.base} 无法加载模型 {model_key}：{e}") from e
+            return self.status()
 
         was_running = bool(st.get("running")) or st.get("state") == "loading"
         if was_running:
@@ -426,6 +469,7 @@ class ModelServiceClient:
                 "error": st.get("error") or "",
                 "elapsed": elapsed,
                 "load_seconds": st.get("load_seconds"),
+                "progress": st.get("progress"),
                 "source": st.get("source"),
             },
             "current": cur,

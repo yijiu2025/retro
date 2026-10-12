@@ -74,7 +74,9 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 from model_client import ModelServiceClient  # noqa: E402
 from model_runtime import (  # noqa: E402
+    DEFAULT_SEARCH_ALGORITHM,
     MODELS,
+    SEARCH_ALGORITHMS,
     canon_smiles,
     forward_models_catalog,
     make_inventory,
@@ -331,6 +333,15 @@ _API_INDEX = {
         {"method": "POST", "path": "/api/feedback", "desc": "记录一条「预测 vs 实测」反馈（落盘 feedback.jsonl 供训练）"},
         {"method": "GET", "path": "/api/feedback", "desc": "读回已收集的反馈（供导出/查看）"},
     ],
+    # 🔴 搜索算法的可选值**由后端给出**，前端不要自己硬编码一份列表：
+    #    合法值的唯一判据是 model_runtime.SEARCH_ALGORITHMS（新增算法改那一处即可），
+    #    前端硬编码就会出现「后端加了算法、界面选不到」或「界面能选、后端默默退回默认」。
+    #    形状与 /api/models 的 models 列表对齐：[{key, label, desc}, ...]
+    "search_algorithms": [
+        {"key": key, "label": label, "desc": desc}
+        for key, (label, desc) in SEARCH_ALGORITHMS.items()
+    ],
+    "default_search_algorithm": DEFAULT_SEARCH_ALGORITHM,
 }
 
 
@@ -1269,6 +1280,7 @@ def api_jobs_create():
       请求体：{"smiles": "...", "model": "pistachio", "max_routes": 5,
                "max_calls": 60, "time_limit": 120, "max_depth": 3,
                "max_heavy_atoms": 10, "value_fn": "complexity",
+               "algorithm": "retro_star",
                "purchasable": [], "required_materials": [],
                "use_forward_filter": false, "forward_top_k": 5}
 
@@ -1295,6 +1307,7 @@ def api_jobs_create():
             "max_depth": int(data.get("max_depth", 3)),
             "max_heavy_atoms": int(data.get("max_heavy_atoms", 10)),
             "value_fn": str(data.get("value_fn") or "complexity"),
+            "algorithm": str(data.get("algorithm") or "").strip().lower(),
             "purchasable": data.get("purchasable") or [],
             "required_materials": data.get("required_materials") or [],
             # 可行性过滤（正向模型当判据）。默认关 —— 它要额外常驻一份正向模型。
@@ -1461,6 +1474,9 @@ def api_search():
     max_depth = int(data.get("max_depth", 3))
     max_heavy_atoms = int(data.get("max_heavy_atoms", 10))
     value_fn = str(data.get("value_fn") or "complexity").strip().lower()
+    # 搜索算法：非法值不报错，交给下游静默退回默认 —— 这里不重复维护白名单，
+    # 唯一的合法性判据是 model_runtime.SEARCH_ALGORITHMS。
+    algorithm = str(data.get("algorithm") or "").strip().lower()
     raw_purchasable = data.get("purchasable") or []
     raw_required = data.get("required_materials") or []
 
@@ -1533,6 +1549,7 @@ def api_search():
                 "max_depth": max_depth,
                 "max_heavy_atoms": max_heavy_atoms,
                 "value_fn": value_fn,
+                "algorithm": algorithm,
                 "purchasable": purchasable,
                 "required_materials": required,
                 # 可行性过滤：正向模型当判据（见 model_runtime.wrap_with_forward_filter）。

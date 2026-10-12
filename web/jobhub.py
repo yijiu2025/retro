@@ -590,8 +590,13 @@ def make_search_runner(
 
     参数契约与同步 /api/search 一致（见 app.py api_search）：
       params = {smiles, model, max_routes, max_calls, time_limit, max_depth,
-                max_heavy_atoms, value_fn, purchasable, required_materials,
-                use_forward_filter, forward_top_k}
+                max_heavy_atoms, value_fn, algorithm, purchasable,
+                required_materials, use_forward_filter, forward_top_k}
+
+    🔴 `algorithm` 必须在本 runner 里**显式转发**到 search_fn，不能靠透传 params：
+       /api/jobs 的请求体里有它，但本函数是照着「同步接口有哪些字段」逐个挑的，
+       漏挑一个不会报错、只会静默退回默认算法（用户选了 BFS 却拿到 Retro* 的结果）。
+       转发时才由 model_runtime 统一做合法性兜底（非法值退回 retro_star）。
 
     `forward_check()`：开启「可行性过滤」前的闸门（见 app._require_forward_ready）。
       传进来、而不是在 jobhub 里自己判，是为了让「正向模型在不在」只有**一个判据
@@ -637,7 +642,11 @@ def make_search_runner(
         # 3) 搜索在**模型服务进程**里跑（HTTP 转接，复用那里已加载的模型）。
         #    search 是唯一的重活，给它 0.92 的权重（validate/post 各占一点）；
         #    load 被 skip 掉不计入分母，所以 search 要拿掉进度条的大头。
-        note = "Retro* 广度优先 · 吃满调用预算"
+        # 🔴 进度文案里的算法名要跟着 algorithm 变：写死「Retro*」的话，用户选了 BFS
+        #    看到的却是「Retro* 广度优先 · 吃满调用预算」——既自相矛盾（Retro* 是最佳
+        #    优先不是广度优先），也让人以为选择没生效。
+        algo_key = str(job.params.get("algorithm") or "").strip().lower()
+        note = "广度优先 BFS · 逐层铺开吃满调用预算" if algo_key == "bfs" else "Retro* 最佳优先"
         if use_forward_filter:
             note += f" · 正向过滤 top-{forward_top_k}"
         job.begin_stage("search", "多步路线搜索", note, weight=0.92)
@@ -652,6 +661,9 @@ def make_search_runner(
                 "max_depth": int(job.params.get("max_depth", 3)),
                 "max_heavy_atoms": int(job.params.get("max_heavy_atoms", 10)),
                 "value_fn": str(job.params.get("value_fn") or "complexity"),
+                # 搜索算法（retro_star / bfs）。不传 = 下游默认 retro_star；
+                # 非法值也在 model_runtime.run_retro_search 里兜回默认。
+                "algorithm": algo_key,
                 "purchasable": job.params.get("purchasable") or [],
                 "required_materials": job.params.get("required_materials") or [],
                 # 可行性过滤：正向模型对象常驻在模型服务里，由那边按真实状态注入

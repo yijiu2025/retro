@@ -12,7 +12,8 @@
     web/model_server.py →  模型服务（:8001），常驻；由 API 拉起或复用
 
 API 重启时若探测到本服务还活着，就直接复用 —— 模型**不重载**。
-前端永远只跟 API 说话，不直连本服务（8001 只绑定 127.0.0.1）。
+前端永远只跟 API 说话，不直连本服务（默认 8001 只绑 127.0.0.1；容器/跨主机部署时
+用 RETRO_MODEL_HOST 改绑定地址，并自行做好网络隔离 —— 本服务无鉴权）。
 
 🔴 为什么「换模型 = 重启本进程」而不是热切换
 --------------------------------------------
@@ -84,7 +85,10 @@ import model_runtime  # noqa: E402  纯模块：无 Flask 副作用，可安全�
 # 运行参数
 # --------------------------------------------------------------------------
 PORT = int(os.environ.get("RETRO_MODEL_PORT", "8001"))
-HOST = "127.0.0.1"
+# 🔴 默认仍绑 127.0.0.1 —— 模型服务是**内网组件**，前端不直连它，
+#    默认不对外暴露是正确的安全姿态。要跨主机访问时显式设 RETRO_MODEL_HOST=0.0.0.0，
+#    同时必须自己加防火墙/网络策略（它没有鉴权，能调就能加载任意模型、跑推理吃满机器）。
+HOST = os.environ.get("RETRO_MODEL_HOST", "127.0.0.1")
 
 #: state 文件 —— 加载期间本服务**还没起 HTTP**，API 靠这个文件知道「在加载什么」。
 #: 按端口分文件：同一台机器跑两个实例（如做并行验证）时互不干扰。
@@ -106,6 +110,7 @@ def _write_state(**extra) -> None:
         "phase": host.phase,
         "error": host.error,
         "load_seconds": host.load_seconds,
+        "progress": host._progress_now(),
         # 正向模型（可行性过滤用）的状态也要落盘：它可以在 HTTP 起来之后热挂，
         # 前端轮询走 /api/models（HTTP），但进程重启/崩溃后这份记录是唯一线索。
         "forward": host.forward_status(),
@@ -182,7 +187,7 @@ def _install_exit_hooks() -> None:
 
 
 # --------------------------------------------------------------------------
-# HTTP 接口（只有 API 服务会来调它；绑定 127.0.0.1，不对外）
+# HTTP 接口（只有 API 服务会来调它；默认绑 127.0.0.1，不对外）
 # --------------------------------------------------------------------------
 app = Flask(__name__, static_folder=None)
 
@@ -255,6 +260,8 @@ def search():
     allowed = (
         "smiles", "max_routes", "max_calls", "time_limit", "max_depth",
         "max_heavy_atoms", "value_fn", "purchasable", "required_materials",
+        # 搜索算法（retro_star / bfs；非法值由 run_retro_search 兜回默认）
+        "algorithm",
         # 可行性过滤（正向模型当判据）。forward_model **不在**白名单里：
         # 那个对象常驻在本进程，由 host.search() 自己注入，客户端不该也无法指定。
         "use_forward_filter", "forward_top_k",
@@ -317,6 +324,47 @@ def forward_load():
     return jsonify({"ok": True, "started": True, "key": key, **host.forward_status()})
 
 
+@app.route("/load", methods=["POST"])
+def load():
+    """把本服务切到指定模型。**立即返回**，进度看 /status。
+
+    body: {"model": "pistachio"}
+
+    🔴 为什么这里不能像 /forward/load 那样「后台线程加载完就换」：
+       逆向模型的加载**必须在进程的单线程阶段**完成（Windows 下 spawn 规则子进程，
+       多线程里做会死锁）。而本服务一起 Flask 就有线程了 —— 这正是同机部署下
+       API 选择「停掉旧进程、重新拉起」而不是调本路由的原因（见 model_client.load）。
+
+       本路由的价值在于**跨主机 / 容器部署**：那时 API 进程碰不到这个服务，
+       没法 stop + 重启，只能让它自己「退出码交给 supervisor 重启」。
+       所以这里做的是：置好 RETRO_PRELOAD 期望值 → 退出。supervisor
+       （docker restart policy / systemd Restart=always）会按新的 RETRO_PRELOAD
+       把它拉起来。**没有 supervisor 的裸跑会真的停下来** —— 这是刻意的：
+       与其进程活着却停在错误的模型上，不如停掉让人一眼看见。
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    key = str(data.get("model") or "").strip()
+    if key not in model_runtime.MODELS:
+        return jsonify({"ok": False, "error": f"未知模型: {key or '(空)'}"}), 400
+
+    # 让 supervisor 重启后的进程按新模型预加载（写进环境变量文件供下次读取）
+    want = os.environ.get("RETRO_PRELOAD_FILE", "")
+    if want:
+        try:
+            with open(want, "w", encoding="utf-8") as f:
+                f.write(key)
+        except OSError as e:
+            return jsonify({"ok": False, "error": f"无法写入 {want}: {e}"}), 500
+
+    def _bye_soon():
+        time.sleep(0.25)
+        print(f"[model] 收到切换到「{key}」的请求，退出让 supervisor 重新拉起……", flush=True)
+        _bye(0)
+
+    threading.Thread(target=_bye_soon, daemon=True).start()
+    return jsonify({"ok": True, "switching_to": key, "via": "restart", "requires_supervisor": True})
+
+
 @app.route("/forward/unload", methods=["POST"])
 def forward_unload():
     """卸载正向模型（省内存）。不影响正在加载 / 已就绪的逆向模型。"""
@@ -349,7 +397,7 @@ def main() -> None:
     print("=" * 68, flush=True)
     print("  RetroChimera 模型服务（常驻）", flush=True)
     print("=" * 68, flush=True)
-    print(f"  监听 127.0.0.1:{PORT}   （仅本机；前端不直连它，只经 API 服务）", flush=True)
+    print(f"  监听 {HOST}:{PORT}   （前端不直连它，只经 API 服务）", flush=True)
 
     _install_exit_hooks()
 
@@ -418,7 +466,7 @@ def main() -> None:
             flush=True,
         )
 
-    print(f"  状态接口: http://127.0.0.1:{PORT}/status", flush=True)
+    print(f"  状态接口: http://{HOST}:{PORT}/status", flush=True)
     print("=" * 68, flush=True)
 
     # 走到这里才起 Flask —— 此时加载已完成，spawn 不再发生，多线程安全。

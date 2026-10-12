@@ -327,11 +327,61 @@ def wrap_with_forward_filter(backward_model, forward_model, top_k: int = 5):
     )
 
 
+# --------------------------------------------------------------------------
+# 搜索算法注册表
+# --------------------------------------------------------------------------
+# 🔴 只登记**不需要任何额外训练产物**就能跑的算法 —— 也就是客户端换个下拉就能切。
+#    syntheseus 里还有 MCTS / PDVN-MCTS，但它们要 policy 模型（PDVN 构造里直接
+#    `assert self.policy is not None`），缺了产物就起不来，所以不进这张表。
+#
+#    key -> (展示名, 一句话说明)。后端在这里做**唯一**的合法性判定，
+#    非法值一律退回默认算法（`run_retro_search` 里的 `if algorithm not in ...`）。
+SEARCH_ALGORITHMS = {
+    "retro_star": ("Retro*", "最佳优先：按「剩余步数估计 + 反应代价」挑最有望的节点先展开"),
+    "bfs": ("广度优先 BFS", "逐层铺开：不做取舍，覆盖最全，但调用预算吃得很凶"),
+}
+DEFAULT_SEARCH_ALGORITHM = "retro_star"
+
+
+def _build_searcher(algorithm, *, reaction_model, mol_inventory, value_fn,
+                    max_heavy_atoms, **common):
+    """按算法名构造搜索器。各算法**共用同一套** `SearchAlgorithm` 构造参数
+    （`limit_reaction_model_calls` / `time_limit_s` / `max_expansion_depth` …），
+    差别只在要不要 value function 这类**算法专属**入参 —— 所以这里是一个 switch
+    而不是两条搜索流程。
+
+    🔴 为什么必须分开构造、不能统一传 `value_function=...`：
+        `SearchAlgorithm.__init__` 收的是 **kwargs 直通 `object.__init__`**，
+        多传一个它不认识的 `value_function` 会直接 TypeError。Retro* 那两个专属
+        参数来自 `ValueFunctionMixin`，BFS 不吃也不认。
+    """
+    if algorithm == "bfs":
+        from syntheseus.search.algorithms.breadth_first import AndOr_BreadthFirstSearch
+
+        return AndOr_BreadthFirstSearch(
+            reaction_model=reaction_model,
+            mol_inventory=mol_inventory,
+            **common,
+        )
+
+    from syntheseus.search.algorithms.best_first.retro_star import RetroStarSearch
+    from syntheseus.search.node_evaluation.common import ReactionModelLogProbCost
+
+    return RetroStarSearch(
+        reaction_model=reaction_model,
+        mol_inventory=mol_inventory,
+        value_function=make_value_function(value_fn, mol_inventory, max_heavy_atoms),
+        and_node_cost_fn=ReactionModelLogProbCost(),
+        **common,
+    )
+
+
 def run_retro_search(model, *, smiles, max_routes=5, max_calls=60, time_limit=120.0,
                      max_depth=3, max_heavy_atoms=10, value_fn="complexity",
                      purchasable=None, required_materials=None,
-                     use_forward_filter=False, forward_top_k=5, forward_model=None):
-    """跑一次 Retro* 搜索并提取路线（**纯函数，只依赖传入的 model 对象**）。
+                     use_forward_filter=False, forward_top_k=5, forward_model=None,
+                     algorithm="retro_star"):
+    """按 `algorithm` 跑一次多步搜索并提取路线（**纯函数，只依赖传入的 model 对象**）。
 
     🔴 为什么接受「model 对象」而不是 model_key：
        搜索任务要在**模型服务进程**里跑（复用那里已加载的模型，不在别处
@@ -341,16 +391,19 @@ def run_retro_search(model, *, smiles, max_routes=5, max_calls=60, time_limit=12
     use_forward_filter / forward_top_k / forward_model：
        见 `wrap_with_forward_filter`。关上时（默认）`forward_model` 传什么都会被忽略。
 
+    algorithm：
+       搜索算法，见 `SEARCH_ALGORITHMS`。两种算法共用同一套 `SearchAlgorithm`
+       构造参数（详见 `_build_searcher`），差异只在要不要 value function /
+       AND 节点代价，所以这里是「选一个构造子」而不是写两条搜索流程。
+
     返回 dict（不含 jsonify 包装）：{ok, target, model, routes, starting_materials,
-    purchasable, required_materials, filtered_out, value_fn, forward_filter,
+    purchasable, required_materials, filtered_out, algorithm, value_fn, forward_filter,
     forward_top_k, acceptance_rate, stats, load_seconds, search_seconds}。
     异常由调用方决定如何呈现。
     """
     from syntheseus import Molecule
-    from syntheseus.search.algorithms.best_first.retro_star import RetroStarSearch
     from syntheseus.search.analysis.route_extraction import iter_routes_time_order
     from syntheseus.search.graph.and_or import AndNode, OrNode
-    from syntheseus.search.node_evaluation.common import ReactionModelLogProbCost
 
     # 参数保护（与 /api/search 同一套边界，别让服务端收到越界值）
     max_routes = max(1, min(int(max_routes), 20))
@@ -359,6 +412,8 @@ def run_retro_search(model, *, smiles, max_routes=5, max_calls=60, time_limit=12
     max_depth = max(1, min(int(max_depth), 8))
     max_heavy_atoms = max(1, min(int(max_heavy_atoms), 40))
     forward_top_k = max(1, min(int(forward_top_k), 50))
+    if algorithm not in SEARCH_ALGORITHMS:
+        algorithm = DEFAULT_SEARCH_ALGORITHM
     if value_fn not in ("constant", "complexity"):
         value_fn = "complexity"
 
@@ -387,11 +442,12 @@ def run_retro_search(model, *, smiles, max_routes=5, max_calls=60, time_limit=12
     #    跨搜索复用同一分子的预测结果能显著加速「换参数重跑同一目标」。
     _calls_base = search_model.num_calls()
     t1 = time.time()
-    searcher = RetroStarSearch(
+    searcher = _build_searcher(
+        algorithm,
         reaction_model=search_model,
         mol_inventory=inventory,
-        value_function=make_value_function(value_fn, inventory, max_heavy_atoms),
-        and_node_cost_fn=ReactionModelLogProbCost(),
+        value_fn=value_fn,
+        max_heavy_atoms=max_heavy_atoms,
         limit_reaction_model_calls=_calls_base + max_calls,
         time_limit_s=time_limit,
         max_expansion_depth=max_depth,
@@ -478,6 +534,8 @@ def run_retro_search(model, *, smiles, max_routes=5, max_calls=60, time_limit=12
         "purchasable": sorted(purchasable or []),
         "required_materials": sorted(required_materials or []),
         "filtered_out": filtered_out,
+        # 跑的到底是哪个算法：同一个分子换个算法结果会差很多，没有它用户只能猜
+        "algorithm": algorithm,
         "value_fn": value_fn,
         # 可行性过滤：开没开、判据用的 top-k、以及**实际通过率**。
         # acceptance_rate 是「候选反应里有多少条通过了正向校验」—— 它把「过滤真的
@@ -604,6 +662,14 @@ class ModelHost:
         self.started_at = 0.0
         self.ready_at = 0.0
         self.load_seconds = 0.0
+        #: 加载进度（0~100）。**是估算**不是精确值：三个阶段（import / model / rules）
+        #:   各自只给一个锚点，阶段内部按"已耗时占该阶段预估时长"插值，最终封顶 99
+        #:   （100 只留给 state == "ready"，见 status()）。前端据此画真进度条。
+        self.progress = 0.0
+        #: 当前阶段起点（秒级时间戳）。`_progress_now` 用它算「阶段内已耗时」，
+        #:   而不是拿「总耗时」直接套 —— 总耗时含前面阶段的时长，直接除会让
+        #:   阶段一进来就跳一截（实测 model 阶段一进就 30%+）。
+        self._stage_started_at = 0.0
 
         # --- 正向模型（「可行性过滤」的判据，与逆向模型互不影响）---
         self._forward_model = None
@@ -612,6 +678,11 @@ class ModelHost:
         self.forward_state = "idle"
         self.forward_error = ""
         self.forward_load_seconds = 0.0
+        #: 正向模型加载进度（0~100，**估算**）。与逆向模型的 `progress` 同义但
+        #: **独立存储** —— 两个模型可以同时在加载，共用一个变量会互相覆盖成对方的进度。
+        self.forward_progress = 0.0
+        #: 正向模型当前阶段的起点（秒级时间戳），供 _forward_progress_now 算阶段内耗时。
+        self._forward_stage_started_at = 0.0
         #: 加载串行化 —— 前端可能连点两次「加载」，而它要几十秒，不串行就会载两份。
         self._forward_lock = threading.Lock()
 
@@ -626,6 +697,15 @@ class ModelHost:
             #    （「模型正在加载中（导入推理依赖…）」）。存 "import" / "model"
             #    这种代号会原样透到用户眼前，看着像报错信息。
             self.phase = text
+            # 进度锚点：三个阶段各占一段。这里只在**进入阶段时**给一个下界，
+            #    阶段内部的爬升交给 status() 用「阶段内耗时」插值（见 _progress_now）。
+            #    🔴 同时重记阶段起点：否则插值拿总耗时直接除，阶段一进就跳一截。
+            self.progress = {
+                "import": 0.0,
+                "model": 30.0,
+                "rules": 88.0,
+            }.get(name, self.progress)
+            self._stage_started_at = time.time()
             if on_phase:
                 try:
                     on_phase(name, text)
@@ -640,6 +720,12 @@ class ModelHost:
         self.state = "loading"
         self.error = ""
         self.started_at = time.time()
+        # 🔴 `model_key` 必须**一进 loading 就设**，不能等加载完才赋值：加载权重那几十秒
+        #    （`RetroChimeraModel(...)` 阻塞）里 state 文件的 `model` 字段一直是空串，
+        #    model_client 据此算出的 `current` 也是空 ⇒ 前端 `models` 三行全 idle、
+        #    「当前选中模型」state 是 idle ⇒ 进度条（只在 state==='loading' 时渲染）
+        #    永远不出现。提前设上，加载全程 `model` 都有值、进度条才出得来。
+        self.model_key = key
         _phase("import", "导入推理依赖（retrochimera / syntheseus）")
         from retrochimera import RetroChimeraModel
 
@@ -664,6 +750,8 @@ class ModelHost:
             self.state = "idle"
             self.phase = ""
             self.ready_at = 0.0
+            self.progress = 0.0
+            self._stage_started_at = 0.0
 
     # ---------- 正向模型（「可行性过滤」的判据） ----------
     def load_forward(self, key: str = "", on_phase=None) -> None:
@@ -678,7 +766,11 @@ class ModelHost:
         if key not in FORWARD_MODELS:
             raise ValueError(f"未知正向模型: {key}")
 
-        def _phase(text: str) -> None:
+        def _phase(text: str, anchor: float) -> None:
+            # 进度锚点：正向模型只有两段（导入依赖 15 / 加载权重 99），比逆向模型少一段
+            # 规则加载。阶段内爬升交给 _forward_progress_now 插值，所以这里只给下界。
+            self.forward_progress = anchor
+            self._forward_stage_started_at = time.time()
             if on_phase:
                 try:
                     on_phase(text)
@@ -705,11 +797,15 @@ class ModelHost:
             self.forward_key = key
             self.forward_error = ""
             t0 = time.time()
+            # 进度归零重开：换模型重载时不能沿用上一轮的数字（否则界面一进来就显示
+            # 88% 然后再退回 15%，看起来像倒退卡死）。
+            self.forward_progress = 0.0
+            self._forward_stage_started_at = 0.0
             try:
-                _phase("导入正向模型依赖（retrochimera / torch）")
+                _phase("导入正向模型依赖（retrochimera / torch）", 15.0)
                 from retrochimera import ForwardChimeraDeNovoModel
 
-                _phase(f"加载正向模型权重：{os.path.basename(path)}")
+                _phase(f"加载正向模型权重：{os.path.basename(path)}", 88.0)
                 # device 由基类自动定（有 CUDA 用 cuda:0，否则 cpu），不用显式传。
                 model = ForwardChimeraDeNovoModel(model_dir=path)
             except Exception as e:  # noqa: BLE001
@@ -722,6 +818,7 @@ class ModelHost:
             self._forward_model = model
             self.forward_load_seconds = round(time.time() - t0, 1)
             self.forward_state = "ready"
+            self.forward_progress = 100.0
 
     def unload_forward(self) -> None:
         """释放正向模型（内存紧的时候用；不影响正在跑的逆向模型）。"""
@@ -731,13 +828,43 @@ class ModelHost:
             self.forward_state = "idle"
             self.forward_error = ""
             self.forward_load_seconds = 0.0
+            self.forward_progress = 0.0
+            self._forward_stage_started_at = 0.0
+
+    def _forward_progress_now(self) -> float:
+        """正向模型加载进度（0~100）。分段：导入依赖 0→15、加载权重 15→99，100 属ready。
+
+        🔴 与 `_progress_now` 同口径（都是**估算**，都用「阶段内耗时」而非总耗时插值），
+           但**锚点不同**：正向模型不 spawn 规则子进程，少一段最慢的规则加载。
+        """
+        if self.forward_state == "ready":
+            return 100.0
+        if self.forward_state != "loading" or not self._forward_stage_started_at:
+            return self.forward_progress
+        stage_elapsed = max(0.0, time.time() - self._forward_stage_started_at)
+        if self.forward_progress < 15.0:
+            lo, hi, est = 0.0, 15.0, 12.0
+        else:
+            lo, hi, est = 15.0, 99.0, 40.0
+        frac = min(1.0, stage_elapsed / max(est, 0.001))
+        return min(hi, lo + (hi - lo) * frac)
 
     def forward_status(self) -> dict:
+        """正向模型状态。与逆向模型的 status 同构（都有 progress / load_seconds），
+        前端画加载进度条可以用同一套逻辑，不必为正向模型单开一条分支。
+
+        🔴 progress 是**估算**（与逆向模型的 `_progress_now` 同口径）：
+           正向模型只有「导入依赖 → 加载权重」两段，比逆向模型少一段规则加载，
+           所以分段锚点是 0→15 / 15→99，而不是 0→30 / 30→88 / 88→99。
+        """
         return {
             "key": self.forward_key,
             "state": self.forward_state,
             "error": self.forward_error,
             "load_seconds": self.forward_load_seconds,
+            # 🔴 与逆向模型的 `progress` 同名同义（0~100，100 只在 ready）。
+            #    正向模型走自己的一条 _phase 链，锚点少一段：0→15、15→99。
+            "progress": self._forward_progress_now(),
         }
 
     # ---------- 推理 / 搜索 ----------
@@ -764,7 +891,7 @@ class ModelHost:
         ]
 
     def search(self, params: dict) -> dict:
-        """多步路线搜索（Retro*）。params 见 run_retro_search 的签名。
+        """多步路线搜索。params 见 run_retro_search 的签名（含 `algorithm`）。
 
         🔴 正向模型由**这里**注入，而不是让调用方把对象传进来：正向模型常驻在本
            进程，调用方（API / 前端）根本不持有它。调用方只说「要不要过滤」
@@ -786,6 +913,7 @@ class ModelHost:
             "phase": self.phase,
             "error": self.error,
             "load_seconds": self.load_seconds,
+            "progress": self._progress_now(),
             # 正向模型（可行性过滤用）单独一份，不跟逆向模型的 state 混：
             # 两者可以同时在跑，且生命周期完全独立（一个是进程级、一个可热挂）。
             "forward": self.forward_status(),
@@ -796,3 +924,32 @@ class ModelHost:
             elif self.ready_at:
                 out["elapsed"] = round(self.ready_at - self.started_at, 1)
         return out
+
+    def _progress_now(self) -> float:
+        """当前加载进度（0~100）。三个阶段（import→30 / model→88 / rules→99），
+        100 只属于 ready。阶段内用「**阶段内已耗时** / 该阶段预估时长」插值，让进度条
+        平滑爬行而不是只在阶段切换时跳一下 —— 阶段时长不可预测，所以是**估算**：
+        权重加载那步（model）实际由外部库内部循环决定，这里只能按经验给个上限。
+
+        🔴 必须用 `_stage_started_at`（阶段起点）算阶段内耗时，**不能**用
+           `time.time() - started_at`（总耗时）：总耗时含前面阶段的时长，直接除会让
+           阶段一进来就跳一截（model 阶段进来时总耗时已 ≥ import 的十几秒，直接 /45
+           就是 30%+）。"""
+        if self.state == "ready":
+            return 100.0
+        if self.state != "loading" or not self.started_at:
+            return self.progress
+        if self._stage_started_at:
+            stage_elapsed = max(0.0, time.time() - self._stage_started_at)
+        else:
+            # 阶段起点还没记（理论上 load() 第一个 _phase 就会记）—— 兜底用总耗时
+            stage_elapsed = max(0.0, time.time() - self.started_at)
+        # 三段各自的预估时长（秒）与目标上界
+        if self.progress < 30.0:
+            lo, hi, est = 0.0, 30.0, 20.0
+        elif self.progress < 88.0:
+            lo, hi, est = 30.0, 88.0, 45.0
+        else:
+            lo, hi, est = 88.0, 99.0, 12.0
+        frac = min(1.0, stage_elapsed / max(est, 0.001))
+        return min(hi, lo + (hi - lo) * frac)
