@@ -49,6 +49,7 @@ retrochimera/
 │   ├── predict.py            Single-step prediction CLI (confidence tiers + reaction depictions)
 │   ├── search.py             Multi-step route search CLI
 │   ├── download_model.py     Model checkpoint downloader
+│   ├── verify_vendored.py    Verify core/ matches upstream (catches missing files)
 │   └── repair_deps.py        Dependency self-check and repair
 ├── deploy/                 ← Deployment material
 │   ├── environment-win.yml   Conda environment export (Windows)
@@ -260,6 +261,7 @@ to be running — they load the model themselves.
 | `scripts/predict.py` | Single-step prediction with confidence tiers and reaction depictions | `python scripts/predict.py "CC(=O)Oc1ccccc1C(=O)O" 5` |
 | `scripts/search.py` | Multi-step route search (Retro*), can emit JSON | `python scripts/search.py "Oc1ccc(OCc2ccccc2)c(Br)c1" 80 150 3` |
 | `scripts/repair_deps.py` | Dependency self-check/repair: probe each import, reinstall what's broken | `python scripts/repair_deps.py` |
+| `scripts/verify_vendored.py` | Verify `core/` matches upstream (detects missing files; needs network) | `python scripts/verify_vendored.py` |
 
 `predict.py` writes structure images to `<repo root>/outputs/` (not committed).
 
@@ -405,6 +407,15 @@ RETRO_LLM_TIMEOUT=300
   effect, and they **must precede** torch / retrochimera / syntheseus. Comment them out or
   move them later and you effectively uninstall the fix — symptoms are `_ssl` load failure
   and WinError 1455 respectively. See `bootstrap/__init__.py`.
+- **Anchored directory rules in `.gitignore` are mandatory** (`/models/`, not
+  `models/`). A gitignore directory pattern matches directories **at any depth**, so
+  `models/` — written to exclude the 9GB of weights — also excluded
+  `core/retrochimera/models/`, which sits on the
+  `retrochimera/__init__ → inference → models` import chain.
+  The symptom is exceptionally well-hidden: **everything works locally** (retrochimera
+  is installed with `pip install -e .`, so the missing files are silently supplied by the
+  local copy), yet anyone who clones gets `ImportError` on `import retrochimera`.
+  Run `python scripts/verify_vendored.py` after touching ignore rules.
 - **The upstream code in `core/` is a runtime dependency** — deleting it breaks startup.
   It's vendored, so you can restore it by re-pulling this repo (no need to clone upstream).
 

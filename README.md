@@ -48,6 +48,7 @@ retrochimera/
 │   ├── predict.py            单步预测 CLI（置信度分级 + 出反应结构图）
 │   ├── search.py             多步合成路线搜索 CLI
 │   ├── download_model.py     模型权重下载
+│   ├── verify_vendored.py    校验 core/ 与上游一致（防漏文件）
 │   └── repair_deps.py        依赖自检自修（坏哪个重装哪个）
 ├── deploy/                 ← 部署物料
 │   ├── environment-win.yml   conda 环境导出文件（Windows）
@@ -247,6 +248,7 @@ npm install && npm run dev        # http://localhost:5177
 | `scripts/predict.py` | 单步预测，带置信度分级并生成反应结构图 | `python scripts/predict.py "CC(=O)Oc1ccccc1C(=O)O" 5` |
 | `scripts/search.py` | 多步合成路线搜索（Retro*），可输出 JSON | `python scripts/search.py "Oc1ccc(OCc2ccccc2)c(Br)c1" 80 150 3` |
 | `scripts/repair_deps.py` | 依赖自检自修：逐个探测导入，坏哪个重装哪个 | `python scripts/repair_deps.py` |
+| `scripts/verify_vendored.py` | 校验 `core/` 与上游是否一致（查漏文件，需联网） | `python scripts/verify_vendored.py` |
 
 `predict.py` 生成的结构图写在 `<仓库根>/outputs/`（该目录不入库）。
 
@@ -379,6 +381,13 @@ RETRO_LLM_TIMEOUT=300
   且**必须早于 torch / retrochimera / syntheseus**。把这几行注释掉或挪到后面，
   等于直接卸载修复，症状分别是 `_ssl` 加载失败和 WinError 1455。
   细节见 `bootstrap/__init__.py`。
+- **`.gitignore` 的目录规则必须用前导斜杠锚定**（`/models/` 而不是 `models/`）。
+  gitignore 的目录模式会匹配**任意层级**的同名目录 —— 写 `models/`（本意排除
+  9GB 权重）会连带排掉 `core/retrochimera/models/`，而它在
+  `retrochimera/__init__ → inference → models` 的导入链上。
+  症状极其隐蔽：**本机完全正常**（retrochimera 是 `pip install -e .` 装的，
+  缺的文件被本机副本补上了），但别人 clone 后 `import retrochimera` 直接
+  ImportError。改 ignore 规则后请跑 `python scripts/verify_vendored.py` 自检。
 - **`core/` 里的上游代码是本项目依赖的一部分**，删了服务起不来；
   它是 vendored 的，重新从 git 拉本仓即可恢复（不需要联网去上游 clone）。
 

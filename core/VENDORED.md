@@ -55,7 +55,14 @@ web/               ← 本项目：Flask API 封装（我们写的），import r
 
 ## 本仓对上游做的本地化改动
 
-除下表外，本目录的**已有文件**与上游 `v1.3.0` **逐字节一致**（表中 `*.zh-CN.md` 属本仓新增文件，不是对上游文件的改动）：
+除下表外，本目录的**已有文件**与上游 `v1.3.0` **内容一致**（表中 `*.zh-CN.md` 属本仓新增文件，不是对上游文件的改动）。
+
+> ⚠️ 关于「一致」的准确含义：本仓的 `.gitattributes` 声明了 `*.md text eol=lf`，
+> 而上游仓库里部分 `.md`（如 `SUPPORT.md`）是 CRLF。所以**换行符被规范化过**，
+> 用 `git hash-object` 与上游 blob SHA 逐个比对时，这些文件会显示为「不一致」，
+> 但那只是 `\r\n` → `\n` 的差异，内容完全相同。校验方法见下方「如何自检」。
+>
+> 这也是本仓新增 `.gitattributes` 的副作用，属预期行为。
 
 | 文件 | 改动 | 原因 |
 | --- | --- | --- |
@@ -75,6 +82,31 @@ git clone --depth 1 --branch v1.3.1 https://github.com/microsoft/retrochimera.gi
 ```bat
 robocopy _tmp_up . /E /XD .git
 ```
+
+### ⚠️ 覆盖后必须自检（否则漏文件你不会知道）
+
+`robocopy` 只会**新增和覆盖**已存在的文件。如果新版本新增了源码文件、
+而你本仓的 `.gitignore` 恰好把它误伤了（比如目录名撞上 `models/`），
+它会「复制成功但没进 git」—— 症状是别人 clone 后 `ImportError`，
+而你本机一切正常（因为本地文件还在，且包是以 `-e` 装的）。
+
+**每次同步完，按下面三步查一遍：**
+
+```bat
+:: 1) 有多少文件被 git 忽略（确认没有源码混进去）
+git status --ignored --porcelain -uall | findstr /B "!!" | findstr /V "__pycache__ .pyc .egg-info models\ web\data .tmp- .workbuddy"
+
+:: 2) 与上游逐文件比对（脚本化，见下）
+python scripts/verify_vendored.py
+```
+
+> 上面第 1 步的过滤串是**白名单式**的：只有全部命中才算正常。
+> 若看到任何 `.py` 结尾的行，说明有源码被误伤，立刻检查 `.gitignore`。
+
+仓库里提供了 `scripts/verify_vendored.py` 做第 2 步：拉取上游 `v1.3.0`
+的文件树与 blob SHA，与本仓逐个比对，报告**缺失**、**未跟踪**、
+**内容不一致**三类问题，并自动忽略换行符与已在
+「本地化改动」表中登记的文件。
 
 ## 为什么不是 git submodule
 
