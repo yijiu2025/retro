@@ -3,9 +3,13 @@
 # 🔴 models/ 是重点：9GB 权重。漏掉这一行，`docker build` 会尝试把 9GB
 #    传给 daemon，轻则构建巨慢，重则磁盘写满。权重一律用 volume 挂载。
 
-# 模型权重与数据
-models/
-web/data/
+# 🔴 models/ 必须是 /models/（锚定到仓库根）。
+#    写成 `models/` 会连 `core/retrochimera/models/`（上游模型定义包，
+#    在导入链上）和 `core/tests/models/` 一起排掉 —— 那样构建出来的
+#    镜像里 retrochimera 包是残缺的，`import retrochimera` 会失败。
+#    同一个坑在 .gitignore 里也踩过一次。
+/models/
+/web/data/
 *.ckpt
 *.pt
 *.zip

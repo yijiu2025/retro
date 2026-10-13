@@ -1,5 +1,18 @@
+# ================================================================
+#  🔴 关键：目录类规则一律用「前导斜杠」锚定到仓库根
+# ------------------------------------------------------------
+#  gitignore 的 `models/` 会匹配**任意层级**的同名目录，包括
+#  `core/retrochimera/models/`（上游的模型定义包）和
+#  `core/tests/models/`。这曾导致 clone 下来的仓库缺这两个目录，
+#  而 retrochimera/__init__ → inference → models 在同一条导入链上，
+#  纯净机器上 `import retrochimera` 直接 ImportError。
+#
+#  正确写法是 `/models/`（只匹配根目录那个）。下面所有目录规则都已按此修正。
+# ================================================================
+
 # === 模型权重（9GB，绝不入库）===
-models/
+# 只排除**仓库根**的 models/，不能碰 core/ 里的同名包目录
+/models/
 *.zip
 
 # === 真实密钥（只提交 .env.example）===
@@ -11,9 +24,9 @@ web/llm_settings.json
 __pycache__/
 *.py[cod]
 *.egg-info/
-.venv/
-venv/
-env/
+/.venv/
+/venv/
+/env/
 build/
 dist/
 
@@ -23,16 +36,17 @@ _startup_log.txt
 web/_startup_log.txt
 *.log
 *.bak
+*.pid
 
 # === 反馈数据（运行时落盘，含实验数据，绝不入库）===
-web/data/
+/web/data/
 
 # === 旧的上游源码克隆目录（已被 core/ 取代，2026-10-06 移出仓库）===
 # 规则保留：万一以后又被 clone 回来，也不要让它进版本库
-repo/
+/repo/
 
 # === 命令行工具产物（scripts/predict.py 生成的反应结构图）===
-outputs/
+/outputs/
 
 # === 编辑器 / 系统 ===
 .vscode/
@@ -41,12 +55,7 @@ outputs/
 Thumbs.db
 
 # === 临时工作目录（vendored 上游准备、探针等，绝不入库）===
-.tmp-*/
+/.tmp-*/
 
 # === AI 助手工作记忆（本地开发产物，含个人偏好，绝不入库）===
-.workbuddy/
-
-# === Linux 部署产物 ===
-# 注：.venv/ 与 _startup_log.txt 在上面「Python 产物」/「运行时日志」两段已列过。
-.venv/
-*.pid
+/.workbuddy/
