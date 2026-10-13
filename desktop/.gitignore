@@ -1,0 +1,6 @@
+# 桌面打包的构建产物与缓存，不入库（重新运行 build_package.py / bake_gpu.py 会再生）
+dist/
+dist-pkg/
+build-cache/
+__pycache__/
+build.log
