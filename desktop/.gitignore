@@ -2,5 +2,6 @@
 dist/
 dist-pkg/
 build-cache/
+_evict_trash/
 __pycache__/
 build.log

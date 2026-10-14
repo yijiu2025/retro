@@ -57,6 +57,9 @@ _ENV_DEFAULTS = {
     "RETRO_MODEL_STATE_FILE": os.path.join(config_store.DATA_DIR, "model-service", "state.json"),
     "RETRO_OUTPUT_DIR": os.path.join(config_store.DATA_DIR, "outputs"),
     "RETRO_RULE_WORKERS": str(config_store.rule_workers()),
+    # 🔴 桌面端：关窗即整体退出，模型服务必须跟着退，否则它（及其规则子进程）
+    #    会变成孤儿在后台跑，且启动器的单实例 Mutex 一直被占 → 关了窗也起不来第二次。
+    "RETRO_MODEL_STOP_WITH_API": "1",
 }
 for _k, _v in _ENV_DEFAULTS.items():
     os.environ.setdefault(_k, _v)
@@ -102,6 +105,43 @@ def _wait_api(timeout: float = 30.0) -> bool:
     return False
 
 
+# --------------------------------------------------------------------------
+# 退出清理：关窗时务必杀掉模型服务进程树（含规则子进程），否则孤儿进程会
+# 占着启动器的单实例 Mutex / 内存 / 端口，导致「关窗后无法重新启动」。
+# --------------------------------------------------------------------------
+_api_app_ref = None
+
+
+def _teardown() -> None:
+    """强杀模型服务整棵进程树（桌面端关窗 / 进程退出时调用，可重复调用）。"""
+    ref = _api_app_ref
+    if ref is None:
+        return
+    try:
+        ref._model_service.stop()
+    except Exception as e:  # noqa: BLE001
+        _log(f"teardown 停止模型服务失败（无碍）: {e}")
+
+
+def _on_window_closed(*_args) -> None:
+    """窗口关闭回调：先清理模型服务，再兜底强制退出本进程。
+
+    🔴 兜底原因：个别 pywebview/Edge 版本下 webview.start() 不一定随关窗返回，
+       本进程不退出 → 启动器一直 hold Mutex → 用户「关了窗也起不来第二次」。
+       这里起一个守护线程，2 秒后若进程还在就 os._exit(0) 强制收尾。
+    """
+    _teardown()
+
+    def _force_exit() -> None:
+        time.sleep(2.0)
+        try:
+            os._exit(0)  # noqa: S102
+        except Exception:  # noqa: BLE001
+            pass
+
+    threading.Thread(target=_force_exit, daemon=True).start()
+
+
 def main() -> None:
     _log(f"包根: {_PKG}")
     _log(f"API 端口: {API_PORT}  模型服务端口: {MODEL_PORT}")
@@ -109,6 +149,12 @@ def main() -> None:
 
     # app.py 以模块导入（它自带 sys.path 修正与 core/ 兜底）
     import app as api_app  # noqa: E402
+
+    # 记住引用，供关窗 / 进程退出时清理模型服务进程树
+    global _api_app_ref
+    _api_app_ref = api_app
+    import atexit
+    atexit.register(_teardown)
 
     api_app._install_exit_hooks()
 
@@ -143,6 +189,10 @@ def main() -> None:
         f"http://127.0.0.1:{API_PORT}",
         width=1480, height=920, min_size=(1024, 680),
     )
+    try:
+        window.events.closed += _on_window_closed
+    except Exception:  # noqa: BLE001
+        pass
     _log("窗口已创建，进入 GUI 消息循环")
     webview.start()  # 阻塞直到用户关窗
 

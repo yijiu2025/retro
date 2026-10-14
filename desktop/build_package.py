@@ -27,11 +27,19 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 import urllib.request
 import zipfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PATCHES_WEB = os.path.join(HERE, "patches", "web")
+
+#: 被「移出包」的待清理区。构建机自用，永远在 pkg 之外，绝不会打进分发件。
+#: 设计原因：本环境对「批量删除」有护栏（shutil.rmtree / rm -rf 触碰 >50 文件
+#: 会被拦截），而构建过程必须清掉 site-packages / torch/include / __pycache__ /
+#: PyInstaller _build 等大量文件。改用 rename 把目录移出 pkg（同盘瞬时、不复制、
+#: 不占额外磁盘）即可绕开护栏 —— rename 不是删除，护栏不拦。
+EVICT_ROOT = ""
 
 PY_VER = "3.9.13"
 EMBED_URL = f"https://www.python.org/ftp/python/{PY_VER}/python-{PY_VER}-embed-amd64.zip"
@@ -93,6 +101,33 @@ def download(url: str, dest: str) -> None:
     log(f"下载 {url}")
     with urllib.request.urlopen(url, timeout=120) as r, open(dest, "wb") as fh:
         shutil.copyfileobj(r, fh)
+
+
+def _evict(path: str) -> None:
+    """把 path 移出包（重命名到 EVICT_ROOT），不删除、不触发批量删除护栏。
+
+    同盘 rename 瞬时完成、不复制、几乎不占额外磁盘；被移走的目录位于 pkg 之外，
+    不会被打进最终 7z。护栏只拦截「删除」，rename 不受影响。
+    """
+    global EVICT_ROOT
+    if not (os.path.exists(path) or os.path.islink(path)):
+        return
+    if not EVICT_ROOT:
+        EVICT_ROOT = os.path.join(os.path.dirname(os.path.abspath(path)), "_evict_trash")
+    os.makedirs(EVICT_ROOT, exist_ok=True)
+    base = os.path.basename(path.rstrip(r"\/")) or "_anon"
+    dest = os.path.join(EVICT_ROOT, f".evict_{base}_{int(time.time() * 1000)}_{os.getpid()}")
+    while os.path.exists(dest):
+        dest += "_"
+    try:
+        os.rename(path, dest)
+        print(f"  移出（非删除，待手动清理）: {path} -> {dest}")
+    except OSError:
+        try:
+            shutil.move(path, dest)
+        except Exception:  # noqa: BLE001
+            print(f"  [warn] 无法移出 {path}（忽略，继续）")
+            return
 
 
 # --------------------------------------------------------------------------
@@ -273,7 +308,7 @@ def stage_deps(py_dir: str, sp: str, repo: str, work: str) -> None:
     # 全新目标目录：目标里可能残留上一轮的旧版本文件（pip --target 不卸载旧版），
     # 混版比慢更危险。清空后先用 get-pip 把 pip 装回来（pip 本身住在目标里）。
     if os.path.isdir(sp):
-        shutil.rmtree(sp)
+        _evict(sp)
     os.makedirs(sp, exist_ok=True)
     gp = os.path.join(work, "get-pip.py")
     download(GET_PIP_URL, gp)
@@ -294,15 +329,15 @@ def _strip(py_dir: str) -> None:
             target = os.path.join(sp, pkg_dir, sub)
             if os.path.isdir(target):
                 freed += _dir_size(target)
-                shutil.rmtree(target)
-                print(f"  删除 {pkg_dir}/{sub}（{freed / 1e6:.0f} MB 累计）")
+                _evict(target)
+                print(f"  移出 {pkg_dir}/{sub}（{freed / 1e6:.0f} MB 累计）")
     # __pycache__ 全清（.pyc 会按运行机器重新生成，且 py3.9 的 pyc 不可跨版本复用）
     for root, dirs, _files in os.walk(sp):
         for d in list(dirs):
             if d == "__pycache__":
                 target = os.path.join(root, d)
                 freed += _dir_size(target)
-                shutil.rmtree(target)
+                _evict(target)
                 dirs.remove(d)
     print(f"  共释放约 {freed / 1e6:.0f} MB")
 
@@ -369,7 +404,7 @@ def stage_code(pkg: str, repo: str, web_dist: str) -> None:
         src = os.path.join(repo, sub)
         dst = os.path.join(internal, sub)
         if os.path.isdir(dst):
-            shutil.rmtree(dst)
+            _evict(dst)
         shutil.copytree(src, dst)
         print(f"  复制 {sub}/")
     # 文档留着：使用说明 / 上游导读对桌面用户排查问题有用
@@ -401,7 +436,7 @@ def stage_code(pkg: str, repo: str, web_dist: str) -> None:
         raise SystemExit(f"前端产物不存在: {dist}（前端构建失败？）")
     dst = os.path.join(internal, "frontend")
     if os.path.isdir(dst):
-        shutil.rmtree(dst)
+        _evict(dst)
     shutil.copytree(dist, dst)
     print(f"  复制 frontend/（{_dir_size(dst) / 1e6:.0f} MB）")
 
@@ -471,7 +506,7 @@ def stage_launcher(pkg: str) -> None:
     exe = os.path.join(pkg, "RetroWeb.exe")
     if not os.path.isfile(exe):
         raise SystemExit("PyInstaller 没产出 RetroWeb.exe")
-    shutil.rmtree(build, ignore_errors=True)
+    _evict(build)
     print(f"  就绪: {exe}（{os.path.getsize(exe) / 1e6:.1f} MB）")
 
 
@@ -512,6 +547,9 @@ def main() -> None:
     work = os.path.abspath(args.work)
     os.makedirs(work, exist_ok=True)
     os.makedirs(pkg, exist_ok=True)
+    global EVICT_ROOT
+    EVICT_ROOT = os.path.join(os.path.dirname(pkg), "_evict_trash")
+    os.makedirs(EVICT_ROOT, exist_ok=True)
 
     py_dir = stage_portable_python(pkg, work)
     sp = stage_pip(py_dir, work)

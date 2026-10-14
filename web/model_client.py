@@ -200,23 +200,59 @@ class ModelServiceClient:
         return subprocess.Popen([sys.executable, self.server_script], **kwargs)
 
     def stop(self, timeout: float = 20.0) -> dict:
-        """请模型服务优雅退出（顺带回收规则子进程）。"""
+        """请模型服务退出。桌面端关窗时必走此路。
+
+        🔴 为什么不能只靠 HTTP /shutdown 轮询：模型服务会 spawn 规则子进程
+           （multiprocessing），且加载中/卡死时 HTTP 可能根本不响应。只轮询的话，
+           进程和它的一堆规则子进程会变成孤儿——关了窗还在后台吃内存、占端口，
+           而且启动器的单实例 Mutex 一直被占着，导致「关了窗也起不来第二次」。
+           所以这里：① 先礼貌发 /shutdown（能优雅回收规则子进程最好）；
+           ② 再按 PID 强杀整棵树（Windows `taskkill /F /T`，类 Unix `killpg`）。
+        """
+        # 1) 礼貌地请它自己退（模型服务收到后会 _bye → 回收规则子进程 → os._exit）
         try:
             _http_json("POST", f"{self.base}/shutdown", body={}, timeout=2.0)
         except Exception:  # noqa: BLE001
             pass
-        # 等它把端口放掉（HTTP 不通 且 state 文件不再更新 ⇒ 已退）
-        end = time.time() + timeout
+
+        # 2) 按 PID 强杀整棵树（优先用本进程拉起的 _proc，否则读 state 文件里的 pid）
+        pid = None
+        if self._proc is not None and getattr(self._proc, "pid", 0):
+            pid = self._proc.pid
+        else:
+            try:
+                with open(self.state_file, encoding="utf-8") as fh:
+                    pid = int((json.load(fh) or {}).get("pid") or 0)
+            except (OSError, ValueError):
+                pid = None
+        if pid and pid_alive(pid):
+            self._kill_tree(pid)
+
+        # 3) 确认已退（强杀通常瞬间完成，最多再等 5s）
+        end = time.time() + min(timeout, 5.0)
         while time.time() < end:
             if not self.status().get("running"):
                 return {"ok": True, "stopped": True}
-            time.sleep(0.5)
-        # 兜底：真的不退就直接杀
-        try:
-            _http_json("POST", f"{self.base}/shutdown", body={}, timeout=1.0)
-        except Exception:  # noqa: BLE001
-            pass
+            time.sleep(0.3)
         return {"ok": True, "stopped": True, "forced": True}
+
+    def _kill_tree(self, pid: int) -> None:
+        """按 PID 杀掉进程及其全部子孙（规则子进程也在内）。跨平台。"""
+        if os.name == "nt":
+            # /F 强杀，/T 连带所有子进程（规则子进程一并清掉）
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(int(pid))],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        else:
+            try:
+                os.killpg(os.getpgid(pid), 9)
+            except Exception:  # noqa: BLE001
+                try:
+                    os.kill(pid, 9)
+                except Exception:  # noqa: BLE001
+                    pass
 
     def ensure(self, model_key: str = "", wait: float = 0.0) -> dict:
         """确保模型服务在跑；必要时拉起。返回当前状态。
