@@ -1,0 +1,95 @@
+# ============================================================================
+# CI —— 提交门禁（retro 独立仓：Python 逆合成后端 + 桌面打包工具链）
+#
+# 本文件是**唯一入口**（家族 CI 规范见 fullstack-rules → ci-conventions.md）：
+#   · 规范层 = ruff（单一配置源是 core/pyproject.toml 的 [tool.ruff]）；
+#     同文件的 black / isort 配置留本地与 pre-commit 用，**刻意不进 CI**——
+#     研究代码库的格式化债不阻断合并，ruff 的 E/W/F/PLE 已覆盖实质规则；
+#   · 单测层 = 复刻上游配方：conda environment.yml（core/，参考环境单一来源）
+#     + pip install -e "core[all]"，与 microsoft/retrochimera CI 同口径；
+#   · 顺序口径：规范 → 单测（无独立类型层：pyproject 有 [tool.mypy] 但未入
+#     dev 依赖，真要开门禁先加依赖，不把没有的层摆着当装饰）；
+#   · 文档入口校验（两级入口 + 死链）搭在规范层，Node 22 跑 scripts/ 下的
+#     校验脚本（规范：fullstack-rules → docs-conventions.md）。
+#
+# 🔴 为什么用 conda 而不是 pip：environment.yml 钉死 pytorch 2.2.2(cuda)/
+#    rdchiral_cpp / pyg 2.5.2 整套编译栈——rdchiral_cpp 没有全平台 PyPI
+#    wheel，torch-sparse 等按 torch 版本出 wheel，pip 复刻不了这个环境。
+# 🔴 本地参考环境以 core/environment.yml 为准；本机 conda env 若漂移
+#    （如 PL 版本），以 CI 口径为权威。
+# ============================================================================
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: 规范（ruff）/ 文档入口
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 文档入口校验（两级入口体系 + 无死链）
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node scripts/check-docs-index.mjs docs
+
+      - name: Install ruff
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install ruff
+
+      # 四个源码目录逐一过 core 的 ruff 配置；models/（9GB 权重）不入库也不扫
+      - name: Ruff check
+        run: ruff check --config core/pyproject.toml core web scripts desktop
+
+  test:
+    name: 单测（pytest）
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash -l {0}
+    env:
+      # 上游 CI 同款：暂时关闭 conda 分片 repodata（上游未修）
+      MAMBA_USE_SHARDED_REPODATA: "false"
+    steps:
+      # torch CUDNN 包约 3GB，先清 runner 预装的大件
+      - name: 释放磁盘空间
+        uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
+
+      - uses: actions/checkout@v4
+
+      - uses: conda-incubator/setup-miniconda@be893c923ea9cf1cf7cd510fbdde27c7e18cbdcb # v4.1.0
+        with:
+          mamba-version: "*"
+          channels: pytorch,nvidia,pyg,conda-forge,defaults
+          channel-priority: true
+          environment-file: core/environment.yml
+
+      - name: Install RetroChimera（editable + all extras）
+        run: pip install -e "core[all]"
+
+      # 与上游同口径：-p 并行收集 + 合并 + 报告；--doctest-modules 由
+      # core/pyproject.toml 的 addopts 带上（会连包内 doctest 一起收）
+      - name: Run pytest（coverage）
+        run: |
+          cd core
+          coverage run -p -m pytest --verbose --durations=50 --durations-min=1.0
+          coverage combine
+          coverage report
