@@ -39,8 +39,7 @@ OUTDIR = os.environ.get("RETRO_OUTPUT_DIR") or os.path.join(_ROOT, "outputs")
 
 def draw_reaction(product_smiles: str, precursor_smiles: str, prob: float, idx: int, outdir: str):
     """把「前体 -> 产物」画成一张反应图。"""
-    from rdkit import Chem
-    from rdkit.Chem import AllChem, Draw
+    from rdkit.Chem import AllChem
     from rdkit.Chem.Draw import rdMolDraw2D
 
     rxn_smiles = f"{precursor_smiles}>>{product_smiles}"

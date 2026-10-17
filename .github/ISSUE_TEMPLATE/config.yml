@@ -1,0 +1,18 @@
+blank_issues_enabled: true
+
+contact_links:
+  - name: 安全漏洞报告（私密渠道）
+    url: https://github.com/yijiu2025/retro/security/advisories/new
+    about: 安全漏洞请勿开公开 issue，走私密报告（需管理员已开启 Private vulnerability reporting）
+  - name: core 包上游问题
+    url: https://github.com/microsoft/retrochimera/issues
+    about: core/ 是 vendored 副本，纯上游缺陷优先到上游仓库报告
+  - name: 前端界面问题（retroweb）
+    url: https://github.com/yijiu2025/retroweb/issues
+    about: 界面 / 交互 / 展示层问题请到 retroweb 仓库报告
+  - name: 贡献指南
+    url: https://github.com/yijiu2025/retro/blob/main/CONTRIBUTING.md
+    about: 上手、代码红线、提交与 PR 流程，提 bug 前建议先读
+  - name: 发布说明
+    url: https://github.com/yijiu2025/retro/tree/main/docs/releases
+    about: 各版本升级必读（手动步骤、破坏性变更）

@@ -79,10 +79,7 @@ from model_runtime import (  # noqa: E402
     SEARCH_ALGORITHMS,
     canon_smiles,
     forward_models_catalog,
-    make_inventory,
-    make_value_function,
     models_catalog,
-    run_retro_search,
 )
 
 #: 常驻模型服务的客户端（API 进程访问模型的**唯一**入口）。
@@ -1536,7 +1533,6 @@ def api_search():
         forward_top_k = 5
 
     try:
-        t0 = time.time()
         # 🔴 搜索一律转接到模型服务（复用那份已加载的模型，本进程不载第二份）。
         #    这里传 model 进去是为了让「未就绪 / 加载的是别的模型」能给出明确报错。
         result = search_remote(

@@ -1,0 +1,123 @@
+name: 缺陷报告
+description: 报告一个可复现的问题（API / 模型服务 / 桌面打包 / core 包 / 脚本 / 部署）
+labels: ['bug']
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: 问题描述
+      description: 发生了什么，期望发生了什么
+      placeholder: |
+        例：预测请求返回 500，日志里 model_server 报句柄泄漏，重启后才能恢复。
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: 复现步骤
+      description: 从零开始的完整步骤，越具体越好
+      placeholder: |
+        1. conda activate retrochimera
+        2. python web/app.py
+        3. curl -X POST http://127.0.0.1:8000/api/predict -d '{"smiles":"CCO","model":"default"}'
+        4. 观察响应
+    validations:
+      required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: 影响组件
+      options:
+        - web API（预测 / 搜索 / LLM / 任务中心）
+        - 模型服务（model_server / model_runtime）
+        - 桌面打包工具链（desktop/）
+        - core 包（vendored 内核）
+        - 脚本（scripts/）
+        - 部署（deploy/、systemd、Docker）
+        - 文档
+        - 其他
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: 版本 / 提交
+      description: release 版本号或 commit sha（不确定就写「main 最新」）
+      placeholder: v1.1.1 或 58f92e3
+    validations:
+      required: true
+
+  - type: dropdown
+    id: env-source
+    attributes:
+      label: 环境来源
+      description: 参考环境单一来源是 core/environment.yml；本机 env 漂移过的请说明
+      options:
+        - conda env create -f core/environment.yml（标准）
+        - deploy/environment-win.yml
+        - Docker / deploy 镜像
+        - 本机自建环境（可能有漂移）
+        - 不确定
+    validations:
+      required: true
+
+  - type: input
+    id: python
+    attributes:
+      label: Python 与 OS
+      placeholder: Python 3.9.7 / Windows 11；Python 3.11 / Ubuntu 22.04 …
+    validations:
+      required: true
+
+  - type: dropdown
+    id: device
+    attributes:
+      label: 计算设备
+      options:
+        - CPU
+        - CUDA（请注明版本）
+        - 不确定 / 与设备无关
+    validations:
+      required: true
+
+  - type: input
+    id: model
+    attributes:
+      label: 涉及模型
+      description: 模型键名 / 权重文件；LLM 类问题注明用的是哪个 endpoint
+      placeholder: default / uspto-50k …
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志摘录
+      description: 关键报错栈即可；**先脱敏**（token、key、内网地址）
+      placeholder: |
+        Traceback (most recent call last): …
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: desensitize
+    attributes:
+      label: 脱敏检查
+      options:
+        - label: 已确认日志 / 截图不含真实密钥、token、内网地址等敏感信息
+          required: true
+
+  - type: textarea
+    id: tried
+    attributes:
+      label: 已尝试过什么
+      description: 排除项写清楚，节省双方时间
+      placeholder: 重启过模型服务、换过模型、对比了 v1.1.0…
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: 附加材料
+    validations:
+      required: false
