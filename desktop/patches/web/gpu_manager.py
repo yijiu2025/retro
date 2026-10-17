@@ -273,7 +273,6 @@ def _install_work() -> None:
 
         # 1) 解析索引页 → 确切 wheel 清单
         wheels = resolve_wheels()
-        total_known = 0
         with _lock:
             _state["wheels"] = [{**w, "done": 0, "state": "pending"} for w in wheels]
             _persist()
@@ -291,7 +290,6 @@ def _install_work() -> None:
                 now = time.time()
                 if total:
                     _w["total"] = total
-                    total_known = total
                 _w["done"] = done
                 if now - _last[0] >= 0.5:
                     _last[0], _last[1] = now, done

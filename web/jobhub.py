@@ -38,7 +38,7 @@ import time
 import traceback
 import types
 import uuid
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stdout
 from typing import Any, Callable, Optional
 

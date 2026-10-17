@@ -265,7 +265,7 @@ def main() -> None:
         try:
             zf = download(info, force=args.force)
             if args.download_only:
-                print(f"  --download-only：只下载，未解压。解压：去掉该参数重跑")
+                print("  --download-only：只下载，未解压。解压：去掉该参数重跑")
                 continue
             extract(zf, info)
             ok, why = verify(info)

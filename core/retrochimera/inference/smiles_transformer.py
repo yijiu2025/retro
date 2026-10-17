@@ -165,7 +165,7 @@ class AbstractSmilesTransformerModel(Generic[InputType, ReactionType]):
         augmented_batch = self._smiles_to_batch(augmented_inputs)
 
         augmented_batch_to_device = {
-            key: val.to(self.device) if type(val) == torch.Tensor else val  # type: ignore[attr-defined]
+            key: val.to(self.device) if type(val) == torch.Tensor else val  # type: ignore[attr-defined]  # noqa: E721  # 上游原样：精确类型判定，勿改 isinstance
             for key, val in augmented_batch.items()
         }
 

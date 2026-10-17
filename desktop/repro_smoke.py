@@ -1,10 +1,8 @@
 # -*- coding: utf-8 -*-
 """最小复现：隔离 smoke_test 失败原因（子进程启动 vs urllib 代理）。"""
-import json
 import os
 import socket
 import subprocess
-import sys
 import time
 import urllib.request
 

@@ -64,7 +64,7 @@ def _log_tail(n: int = 25) -> str:
 def _already_running() -> bool:
     if os.name != "nt":
         return False
-    mutex = ctypes.windll.kernel32.CreateMutexW(None, False, MUTEX_NAME)
+    _mutex = ctypes.windll.kernel32.CreateMutexW(None, False, MUTEX_NAME)  # noqa: F841  # 句柄须保活：具名互斥体随句柄关闭即释放
     return ctypes.windll.kernel32.GetLastError() == ERROR_ALREADY_EXISTS
 
 
