@@ -16,6 +16,62 @@
 | 删构建中间产物 | 用 `_evict`（rename 到 `_evict_trash`），**不要 `rm -rf` / `shutil.rmtree`** |
 | 取 GitHub token | GCM `get`，输出是 `password=gho_...`（**等号，不是冒号**） |
 
+### 构建机必须预装的三样（2026-10-20 实测，缺一个就中断）
+
+| 缺什么 | 症状 | 装法 |
+|---|---|---|
+| **PyInstaller** | 阶段 6/7 失败：`构建机缺少 pyinstaller`，`RetroWeb.exe` 产不出来 | `pip install pyinstaller` |
+| **7z / 7za / 7zr** | `shutil.which` 三个都找不到 | 装 7-Zip，或走 `py7zr` 兜底 |
+| **py7zr**（没有 7z 时） | 脚本降级用它；没装则直接跳过压缩（只给你一个文件夹） | `pip install py7zr` |
+
+🔴 **本机三样原本全没有** —— 这台机器没装 7-Zip，PyInstaller/py7zr 也没装。
+按 SOP 第一次构建就断在阶段 6/7。
+
+🔴 **`pip install` 在这台机器上必须先修 SSL**，否则报
+`SSLError: the SSL module is not available`（conda 未激活的既有坑）：
+
+```bash
+python -c "import os,sys; sys.path.insert(0,'<仓库根>'); from bootstrap import envfix; import pip; pip.main(['install','pyinstaller'])"
+```
+
+### 没有原生 7z 时怎么压（本机实际走的路）
+
+脚本检测不到 `7z`/`7za`/`7zr` 时会降级到 `py7zr`，但它写死 `preset 7`（慢）。
+**按 SOP 用 `preset 3`**，实测 1.7GB → 274MB / **317 秒**：
+
+```python
+import py7zr
+with py7zr.SevenZipFile("dist-pkg.7z", "w",
+                        filters=[{"id": py7zr.FILTER_LZMA2, "preset": 3}]) as z:
+    z.writeall("dist-pkg", "dist-pkg")
+```
+
+⚠️ 用 `py7zr` 时同样要先修 SSL（它自己用 urllib 拉文件时才需要，
+纯本地压缩不需要）—— 但**装 py7zr 本身**需要。
+
+### 冒烟测试会失败的一件事（不是打包坏了）
+
+`smoke_test.py` 最后一步会 `/api/load uspto50k`，而 **9GB 模型权重不在包里**
+⇒ 400 BAD REQUEST，冒烟测试以异常告终。**这是预期的**。
+判断打包是否成功，看它前面这几行过了没有：
+
+```
+[xx:xx] API 就绪
+[xx:xx] desktop/info: frontend_ok=True models_dir=...
+[xx:xx] GET / → HTML 3939 字节（静态托管 OK）
+[xx:xx] GET /settings/models → SPA fallback OK
+[xx:xx] gpu/status: installed=False compute=auto backend={...}
+```
+
+这 5 行齐了 = 链路通。
+
+### 批次删除护栏会在构建末尾触发
+
+阶段 7/7 清理 PyInstaller 的 `_build/`（实测 57 个文件）会命中
+`SAFE_DELETE_BULK_CONFIRM_REQUIRED`，构建以**退出码 1** 结束 ——
+但 `RetroWeb.exe` 其实**已经成功生成**。看到这个别以为失败了，
+确认 exe 在，然后手动把 `_build` rename 进 `_evict_trash/` 即可。
+
 ---
 
 ## 1. 构建 CPU 包
@@ -154,6 +210,27 @@ C:/Users/22701/.workbuddy/binaries/PortableGit/versions/1.3.0/mingw64/bin/git-cr
 
 > 🔴 `publish_release_gpu.py` **当前只传单文件**。发分卷版要改脚本循环上传
 > `.001` / `.002` / …，并在 Release 文案里注明「**下载全部分卷后 7z 解压**」。
+
+> ⚠️ **上面两个脚本的版本号/路径全是写死的**（一次性发版脚本）。
+> 发新版本时**别直接跑**，照着改常量，或直接用 GitHub API 三步走
+> （2026-10-20 发 `desktop-v1.2.0` 走的就是这条，因为脚本里还是 1.0.1）：
+>
+> ```bash
+> # 1) token：GCM get，输出 password=gho_...（等号）
+> TOK=$(printf "protocol=https\nhost=github.com\n\n" \
+>       | "/c/.../git-credential-manager.exe" get | grep '^password=' | cut -d= -f2-)
+> # 2) 建 Release（tag 要先 git push 上去）
+> curl -H "Authorization: Bearer $TOK" -X POST \
+>      https://api.github.com/repos/yijiu2025/retro/releases \
+>      -d '{"tag_name":"desktop-v1.2.0","name":"...","body":"...","draft":false}' \
+>      # → 记下返回的 upload_url（去掉末尾的 {?name,label}）
+> # 3) 上传 asset（274MB 实测约 1 分钟）
+> curl -H "Authorization: Bearer $TOK" -H "Content-Type: application/x-7z-compressed" \
+>      --data-binary "@desktop/dist-pkg.7z" \
+>      "$UP?name=RetroWeb-1.2.0-win64.7z"
+> ```
+>
+> `desktop-v1.2.0` 就是这么做出来的，可作为参照。
 
 ### 上传限制
 
