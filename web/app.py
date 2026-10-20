@@ -82,11 +82,23 @@ from model_runtime import (  # noqa: E402
     models_catalog,
 )
 
+# 物质查询（PubChem / ChemIndex）—— 纯标准库 + 延迟发请求，无启动成本。
+# 🔴 两个模块内部都在**首次请求时**才读 SSL；本模块被 import 不会预热网络。
+from chemindex import ChemIndexError  # noqa: E402
+from chemindex import lookup as chemindex_lookup  # noqa: E402
+from pubchem import PubChemError  # noqa: E402
+from pubchem import lookup_pubchem  # noqa: E402
+
 #: 常驻模型服务的客户端（API 进程访问模型的**唯一**入口）。
 #: 模型不在本进程里 —— 本进程既不加载、也不 spawn 规则子进程。
 _model_service = ModelServiceClient()
 
 app = Flask(__name__, static_folder=None)
+
+# --- CAS 号的形态判据（`/api/substance` 用它猜用户查的是 CAS 还是名称）----
+# 🔴 与前端 `retroweb/src/utils/cas-regex.ts` 是同一份规则（两边各自实现，
+#    但形态判据必须一致，否则前端认为「像 CAS」、后端认为「不像」，行为就分裂了）。
+_CAS_FORMAT_RE = re.compile(r"^\d{2,7}-\d{2}-\d$")
 
 # --- CORS：仅当配置了 RETRO_CORS_ORIGINS 时才启用 -------------------------
 # 🔴 dev 走 vite proxy（同源），不需要 CORS；但**换机部署时前端往往在另一个域名**，
@@ -646,6 +658,73 @@ def api_depict():
                 "smiles": Chem.MolToSmiles(mol),
             }
         )
+    except Exception as e:  # noqa: BLE001
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": f"{type(e).__name__}: {e}"}), 500
+
+
+@app.route("/api/substance", methods=["POST"])
+def api_substance():
+    """按 CAS 号或名称查物质档案（PubChem / ChemIndex 两套可选）。
+
+    body: {"terms": "50-78-2", "source": "pubchem|chemindex", "choice": "cas|name"}
+
+    ## 为什么这是**代理**而不是前端直连
+
+    · **PubChem** 有 CORS 头，前端本来能直连（`utils/cas-lookup.ts` 就是）。
+      走这里是为了让两个数据源有**一致的入口**，前端不必分支两套逻辑。
+    · **ChemIndex** 前端**不可能**直连，两个坎（实测）：
+        1. 响应头**没有** `Access-Control-Allow-Origin` ⇒ CORS 直接拒；
+        2. 有 JS 反爬挑战（响应里塞一段 JS，要把 `_0x2` 写进 `HW_CHECK`
+           cookie 再重发）⇒ 纯 HTTP 客户端第一发必被拦。
+
+    ## 两种源的能力差异（前端据此决定默认选谁）
+
+    | | PubChem | ChemIndex |
+    |---|---|---|
+    | CAS → 结构 | ✅ SMILES | ✅ SMILES（由 InChI 转） |
+    | 名称 → CAS | ✅ | ✅（仅英文名） |
+    | 物性（熔点/沸点/闪点/溶解度/蒸气压） | 部分 | ✅ 齐全 |
+    | 危害符号 / 风险代码 | ✅ | ✅ |
+
+    ## 失败语义
+
+    `{ok: false, found: false}` = 查无此物（**不是**错误，HTTP 200）
+    HTTP 502 = 上游不可用 / 被反爬拦住
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    terms = str(data.get("terms") or "").strip()
+    source = str(data.get("source") or "pubchem").strip().lower()
+    choice = str(data.get("choice") or "auto").strip().lower()
+
+    if not terms:
+        return jsonify({"ok": False, "error": "缺少 terms（CAS 号或物质名称）"}), 400
+    if len(terms) > 200:
+        return jsonify({"ok": False, "error": "terms 过长"}), 400
+
+    try:
+        if source == "chemindex":
+            # choice 不传时按形态猜：像 CAS 号就按 cas 查，否则按名称
+            if choice not in ("cas", "name"):
+                choice = "cas" if _CAS_FORMAT_RE.match(terms) else "name"
+            try:
+                info = chemindex_lookup(terms, choice)
+            except ChemIndexError as e:
+                return jsonify({"ok": False, "error": f"ChemIndex 查询失败：{e}"}), 502
+            if not info:
+                return jsonify({"ok": False, "found": False, "source": "chemindex"})
+            return jsonify({"ok": True, "source": "chemindex", **info})
+
+        # 默认 PubChem
+        if choice not in ("cas", "name"):
+            choice = "cas" if _CAS_FORMAT_RE.match(terms) else "name"
+        try:
+            info = lookup_pubchem(terms, choice)
+        except PubChemError as e:
+            return jsonify({"ok": False, "error": f"PubChem 查询失败：{e}"}), 502
+        if not info:
+            return jsonify({"ok": False, "found": False, "source": "pubchem"})
+        return jsonify({"ok": True, "source": "pubchem", **info})
     except Exception as e:  # noqa: BLE001
         traceback.print_exc()
         return jsonify({"ok": False, "error": f"{type(e).__name__}: {e}"}), 500
